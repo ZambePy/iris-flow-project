@@ -1,0 +1,50 @@
+# ==============================================
+# IrisFlow — Dependências Python
+# Instalar com: pip install -r requirements.txt
+# ==============================================
+
+# --- Visão computacional ---
+mediapipe==0.10.14
+opencv-python==4.10.0.84
+numpy==1.26.4
+
+# --- IA e modelos ---
+tensorflow==2.16.1
+onnxruntime==1.18.1
+openai-whisper==20231117
+
+# --- TTS (Text-to-Speech) ---
+TTS==0.22.0          # Coqui TTS
+pyttsx3==2.90        # Fallback TTS
+
+# --- API ---
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+python-multipart==0.0.9
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
+# --- Banco de dados ---
+sqlalchemy==2.0.30
+alembic==1.13.1       # Migrações do banco
+aiosqlite==0.20.0     # SQLite async (dev)
+asyncpg==0.29.0       # PostgreSQL async (prod)
+
+# --- Supabase ---
+supabase==2.4.6
+
+# --- Stripe ---
+stripe==9.9.0
+
+# --- Variáveis de ambiente ---
+python-dotenv==1.0.1
+
+# --- Testes ---
+pytest==8.2.2
+pytest-asyncio==0.23.7
+httpx==0.27.0          # Cliente HTTP para testar a API
+
+# --- Utilitários ---
+pydantic==2.7.4
+pydantic-settings==2.3.1
+loguru==0.7.2          # Logs mais legíveis

@@ -1,0 +1,70 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# === Ambiente e segredos ===
+.env
+.env.local
+.env.production
+*.pem
+*.key
+
+# === Testes e cobertura ===
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# === Modelos de IA (arquivos grandes) ===
+*.onnx
+*.tflite
+*.h5
+*.pt
+*.pth
+models/
+
+# === Logs ===
+*.log
+logs/
+
+# === IDEs ===
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# === Node.js (dashboard Next.js) ===
+node_modules/
+.next/
+out/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# === Docker ===
+.dockerignore
+
+# === Banco de dados local ===
+*.db
+*.sqlite
+*.sqlite3
+
+# === Arquivos temporários do MediaPipe/OpenCV ===
+*.avi
+*.mp4
+*.jpg
+*.jpeg
+*.png
+# (exceto assets do projeto — adicionar exceções conforme necessário)

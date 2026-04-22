@@ -1,0 +1,48 @@
+version: "3.9"
+
+services:
+
+  # API FastAPI
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    environment:
+      - DATABASE_URL=postgresql://irisflow:irisflow@db:5432/irisflow
+      - ENVIRONMENT=development
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Banco de dados PostgreSQL (espelha o Supabase em produção)
+  db:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: irisflow
+      POSTGRES_PASSWORD: irisflow
+      POSTGRES_DB: irisflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U irisflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Redis (habilitar no Mês 4 se necessário)
+  # redis:
+  #   image: redis:7-alpine
+  #   ports:
+  #     - "6379:6379"
+
+volumes:
+  postgres_data:
