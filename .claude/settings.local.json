@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python.exe -c \"import engine.iris_tracker\")",
+      "Bash(../.venv/Scripts/python.exe -c \"import iris_tracker\")",
+      "Bash(.venv/Scripts/python.exe engine/iris_tracker.py)"
+    ]
+  }
+}

@@ -33,6 +33,38 @@ que concorrentes como Tobii Dynavox (R$ 15k–80k).
 - **STT PT-BR:** OpenAI Whisper (self-hosted, modelo "small")
 - **Linguagem:** Python 3.11+
 
+#### Pipeline de rastreamento (iris_tracker.py — implementado)
+
+**Captura:** câmera a 640×480 para reduzir carga do MediaPipe sem perda de precisão
+(landmarks retornam coordenadas normalizadas [0,1] independente da resolução).
+
+**Feature combinada por frame:**
+`ratio = 0.7 × eye_ratio + 0.3 × face_ratio`
+- `eye_ratio`: posição da íris relativa aos cantos ósseos do olho (baseline estável)
+- `face_ratio`: posição da íris relativa ao span lateral da face (~3× mais largo)
+- Ambos suavizados por EMA (α=0.20) antes da combinação
+
+**Suavização do cursor:**
+1. EMA α=0.20 sobre o ratio combinado (reduz ruído de alta frequência)
+2. Deadzone adaptativa em espaço normalizado — trava cursor quando olho está parado;
+   válvula de escape após MAX_FROZEN=25 frames para não bloquear movimentos lentos
+3. Filtro de Kalman 2D (velocidade constante + amortecimento 0.85) em pixels
+4. LERP fator 0.10 entre posição atual e alvo do Kalman (deslizamento suave)
+5. Cursor mantém última posição conhecida quando íris não é detectada (sem indicação visual de pausa)
+
+**Calibração híbrida em 2 etapas (~2 minutos no total):**
+- *Etapa 1 — Pontos fixos:* grade 3×3 (9 pontos) + ponto central dedicado com peso 3×
+  e 60 frames de coleta; regressão polinomial (afim/bilinear/quadrática por nº de pontos)
+  com mínimos quadrados ponderados
+- *Etapa 2 — Trajetórias dinâmicas:* 6 padrões de movimento (cruz horizontal, cruz vertical,
+  diagonal Z, figura-8, borda da tela, espiral); coleta 1 amostra a cada 2 frames com
+  compensação de lag oculomotor de 4 frames (~130 ms); ~500 pares (íris→tela) combinados
+  com os 10 pontos fixos (peso 0.10 por amostra de trajetória)
+
+**Óculos:** toggle manual `[G]` na tela de setup — eleva confiança mínima do MediaPipe
+de 0.50 para 0.70, melhorando estabilidade de landmarks sob reflexo de lente.
+Usuários de óculos devem garantir boa iluminação frontal (tela de setup exibe indicador).
+
 ### Backend / API
 - **Framework:** FastAPI
 - **Banco dev:** SQLite → PostgreSQL (Supabase em produção)
@@ -140,8 +172,8 @@ Ver `.env.example` para lista completa. As principais:
 ## Comandos úteis
 
 ```bash
-# Rodar engine localmente
-python engine/iris_tracker.py
+# Rodar engine localmente (Windows — usar sempre o .venv)
+.venv/Scripts/python.exe engine/iris_tracker.py
 
 # Rodar API em desenvolvimento
 uvicorn api.main:app --reload

@@ -4,6 +4,7 @@ Mapeia as posições da íris para coordenadas de tela.
 Calibração manual (Mês 1) e adaptativa por LSTM (Mês 3+).
 """
 
+import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from loguru import logger
@@ -35,17 +36,29 @@ class CalibrationModel:
 
 class LinearCalibrator:
     """
-    Calibração linear simples para o MVP (Mês 1–2).
-    Mapeia ratio da íris → posição na tela usando interpolação linear.
-    Requer pelo menos 4 pontos de calibração (cantos da tela).
+    Calibrador polinomial adaptativo.
+
+    Escolhe o modelo com base no número de pontos disponíveis:
+        4–5 pontos  → afim       [x, y, 1]               (3 parâmetros)
+        6–8 pontos  → bilinear   [x, y, x·y, 1]          (4 parâmetros)
+        9+ pontos   → quadrático [x, y, x², y², x·y, 1]  (6 parâmetros)
+
+    Todos resolvidos por mínimos quadrados (lstsq), portanto o sistema é
+    sempre sobredeterminado quando há mais pontos que parâmetros.
     """
 
     MIN_POINTS = 4
 
     def __init__(self) -> None:
-        self.model = CalibrationModel()
-        self._x_coeffs: Optional[Tuple[float, float]] = None  # (slope, intercept)
-        self._y_coeffs: Optional[Tuple[float, float]] = None
+        self.model   = CalibrationModel()
+        self._coeffs_x: Optional[np.ndarray] = None
+        self._coeffs_y: Optional[np.ndarray] = None
+        self._degree:   str = "affine"
+        # Normalização de saída: estica o range de calibração para [0, 1]
+        self._sx_min: float = 0.0
+        self._sx_max: float = 1.0
+        self._sy_min: float = 0.0
+        self._sy_max: float = 1.0
 
     def add_calibration_point(
         self,
@@ -55,32 +68,67 @@ class LinearCalibrator:
         """Adiciona um ponto de calibração."""
         self.model.add_point(iris_ratio, screen_pos)
 
-    def calibrate(self) -> bool:
+    def calibrate(self, weights: Optional[np.ndarray] = None) -> bool:
         """
-        Calcula os coeficientes de mapeamento linear.
+        Ajusta o modelo polinomial com os pontos coletados.
 
-        Retorna:
-            True se a calibração foi bem-sucedida.
+        weights: array de pesos por ponto (mesmo comprimento que model.points).
+                 Usa mínimos quadrados ponderados — pesos maiores forçam o modelo
+                 a ajustar melhor aquele ponto (ex.: centro com peso 2.5×).
+
+        Após o ajuste, aplica normalização linear que estende o range de
+        calibração ao intervalo [0, 1] com margem de 10% para os cantos,
+        permitindo extrapolação até as bordas reais da tela.
         """
-        if len(self.model.points) < self.MIN_POINTS:
+        n = len(self.model.points)
+        if n < self.MIN_POINTS:
             logger.warning(
-                "Calibração requer {} pontos, apenas {} fornecidos.",
-                self.MIN_POINTS,
-                len(self.model.points),
+                "Calibração requer {} pontos, {} fornecidos.",
+                self.MIN_POINTS, n,
             )
             return False
 
-        iris_xs = [p.iris_ratio[0] for p in self.model.points]
-        iris_ys = [p.iris_ratio[1] for p in self.model.points]
-        screen_xs = [p.screen_pos[0] for p in self.model.points]
-        screen_ys = [p.screen_pos[1] for p in self.model.points]
+        ix = np.array([p.iris_ratio[0] for p in self.model.points])
+        iy = np.array([p.iris_ratio[1] for p in self.model.points])
+        sx = np.array([p.screen_pos[0] for p in self.model.points])
+        sy = np.array([p.screen_pos[1] for p in self.model.points])
 
-        # Regressão linear simples: y = mx + b
-        self._x_coeffs = self._linear_regression(iris_xs, screen_xs)
-        self._y_coeffs = self._linear_regression(iris_ys, screen_ys)
+        if n >= 9:
+            A = np.column_stack([ix, iy, ix ** 2, iy ** 2, ix * iy, np.ones(n)])
+            self._degree = "quadratic"
+        elif n >= 6:
+            A = np.column_stack([ix, iy, ix * iy, np.ones(n)])
+            self._degree = "bilinear"
+        else:
+            A = np.column_stack([ix, iy, np.ones(n)])
+            self._degree = "affine"
+
+        # Mínimos quadrados ponderados
+        if weights is not None:
+            W = np.sqrt(np.asarray(weights, dtype=float))
+            A_fit  = A  * W[:, np.newaxis]
+            sx_fit = sx * W
+            sy_fit = sy * W
+        else:
+            A_fit, sx_fit, sy_fit = A, sx, sy
+
+        self._coeffs_x, _, _, _ = np.linalg.lstsq(A_fit, sx_fit, rcond=None)
+        self._coeffs_y, _, _, _ = np.linalg.lstsq(A_fit, sy_fit, rcond=None)
+
+        # Normalização de saída: [sx_min, sx_max] → [0, 1] com 10% de margem
+        # A margem permite que o cursor alcance as bordas da tela por extrapolação.
+        MARGIN = 0.10
+        sx_rng = sx.max() - sx.min()
+        sy_rng = sy.max() - sy.min()
+        self._sx_min = sx.min() - MARGIN * sx_rng
+        self._sx_max = sx.max() + MARGIN * sx_rng
+        self._sy_min = sy.min() - MARGIN * sy_rng
+        self._sy_max = sy.max() + MARGIN * sy_rng
+
         self.model.is_calibrated = True
-
-        logger.info("Calibração concluída com {} pontos.", len(self.model.points))
+        logger.info(
+            "Calibração concluída com {} pontos (modelo: {}).", n, self._degree
+        )
         return True
 
     def predict(self, iris_ratio: Tuple[float, float]) -> Optional[Tuple[float, float]]:
@@ -91,36 +139,31 @@ class LinearCalibrator:
             iris_ratio: (ratio_x, ratio_y) da íris
 
         Retorna:
-            (screen_x, screen_y) normalizados, ou None se não calibrado.
+            (screen_x, screen_y) normalizados 0–1, ou None se não calibrado.
         """
-        if not self.model.is_calibrated or not self._x_coeffs or not self._y_coeffs:
+        if not self.model.is_calibrated:
             logger.warning("Modelo não calibrado. Chame calibrate() primeiro.")
             return None
 
-        screen_x = self._apply(iris_ratio[0], self._x_coeffs)
-        screen_y = self._apply(iris_ratio[1], self._y_coeffs)
+        ix, iy = iris_ratio[0], iris_ratio[1]
 
-        # Garante que fica dentro dos limites da tela
-        screen_x = max(0.0, min(1.0, screen_x))
-        screen_y = max(0.0, min(1.0, screen_y))
+        if self._degree == "quadratic":
+            feat = np.array([ix, iy, ix ** 2, iy ** 2, ix * iy, 1.0])
+        elif self._degree == "bilinear":
+            feat = np.array([ix, iy, ix * iy, 1.0])
+        else:
+            feat = np.array([ix, iy, 1.0])
 
-        return (screen_x, screen_y)
+        raw_x = float(feat @ self._coeffs_x)
+        raw_y = float(feat @ self._coeffs_y)
 
-    @staticmethod
-    def _linear_regression(xs: List[float], ys: List[float]) -> Tuple[float, float]:
-        n = len(xs)
-        mean_x = sum(xs) / n
-        mean_y = sum(ys) / n
-        numerator = sum((xs[i] - mean_x) * (ys[i] - mean_y) for i in range(n))
-        denominator = sum((xs[i] - mean_x) ** 2 for i in range(n))
-        slope = numerator / denominator if denominator != 0 else 1.0
-        intercept = mean_y - slope * mean_x
-        return (slope, intercept)
+        # Aplica normalização: estica range de calibração para [0, 1]
+        rng_x = self._sx_max - self._sx_min
+        rng_y = self._sy_max - self._sy_min
+        sx = (raw_x - self._sx_min) / rng_x if rng_x > 1e-6 else raw_x
+        sy = (raw_y - self._sy_min) / rng_y if rng_y > 1e-6 else raw_y
 
-    @staticmethod
-    def _apply(x: float, coeffs: Tuple[float, float]) -> float:
-        slope, intercept = coeffs
-        return slope * x + intercept
+        return (max(0.0, min(1.0, sx)), max(0.0, min(1.0, sy)))
 
 
 # TODO (Mês 3): Implementar LSTMCalibrator que usa TensorFlow Lite
