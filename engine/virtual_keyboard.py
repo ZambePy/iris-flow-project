@@ -1,185 +1,266 @@
 """
 IrisFlow — Teclado Virtual
-Teclado QWERTY controlado pelo olhar. O usuário seleciona uma tecla
-fixando o olhar por um tempo determinado (dwell time).
+QWERTY controlado pelo olhar. Seleção por dwell time (1.5 s padrão).
+Layout centralizado: 65 % da largura × 55 % da altura do monitor.
 """
+
+import time
+from typing import Callable, List, Optional
 
 import cv2
 import numpy as np
-import time
-from dataclasses import dataclass
-from typing import Optional, Callable, List, Tuple
 from loguru import logger
 
 
-KEYBOARD_LAYOUT = [
+# ---------------------------------------------------------------------------
+# Layout e constantes
+# ---------------------------------------------------------------------------
+
+KEYBOARD_ROWS: List[List[str]] = [
     ["Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"],
-    ["A", "S", "D", "F", "G", "H", "J", "K", "L", "⌫"],
-    ["Z", "X", "C", "V", "B", "N", "M", ",", ".", "↵"],
-    ["ESPAÇO", "FALAR"],
+    ["A", "S", "D", "F", "G", "H", "J", "K", "L", "APAGAR"],
+    ["Z", "X", "C", "V", "B", "N", "M", ",", ".", "ENTER"],
+    ["ESPACO", "FALAR", "LIMPAR"],
 ]
 
-# Cores (BGR)
-COLOR_KEY_BG = (50, 50, 50)
-COLOR_KEY_HOVER = (80, 120, 200)
-COLOR_KEY_ACTIVE = (0, 180, 100)
-COLOR_TEXT = (255, 255, 255)
-COLOR_PROGRESS = (0, 200, 255)
+_WIDE = {"ESPACO", "FALAR", "LIMPAR"}
+
+_C_KEY   = (55,  55,  55)
+_C_HOVER = (90, 130, 200)
+_C_FLASH = (30, 180,  80)
+_C_TXT   = (240, 240, 240)
+_C_PROG  = (0,  210, 255)
+_C_DBG   = (18,  18,  18)
+_C_DBT   = (255, 255, 255)
+
+_FLASH_DUR = 0.35
 
 
-@dataclass
-class Key:
-    """Representa uma tecla do teclado virtual."""
-    label: str
-    x: int
-    y: int
-    width: int
-    height: int
+# ---------------------------------------------------------------------------
+# Tecla
+# ---------------------------------------------------------------------------
 
-    def contains(self, px: float, py: float, frame_w: int, frame_h: int) -> bool:
-        """Verifica se a posição (normalizada) está sobre esta tecla."""
-        abs_x = int(px * frame_w)
-        abs_y = int(py * frame_h)
-        return self.x <= abs_x <= self.x + self.width and self.y <= abs_y <= self.y + self.height
+class _Key:
+    __slots__ = ("label", "x", "y", "w", "h", "_pressed_at")
+
+    def __init__(self, label: str, x: int, y: int, w: int, h: int) -> None:
+        self.label       = label
+        self.x, self.y   = x, y
+        self.w, self.h   = w, h
+        self._pressed_at = 0.0
+
+    def hit(self, px: float, py: float) -> bool:
+        return self.x <= px <= self.x + self.w and self.y <= py <= self.y + self.h
 
     @property
-    def center(self) -> Tuple[int, int]:
-        return (self.x + self.width // 2, self.y + self.height // 2)
+    def cx(self) -> int:
+        return self.x + self.w // 2
 
+    @property
+    def cy(self) -> int:
+        return self.y + self.h // 2
+
+    def flash(self) -> None:
+        self._pressed_at = time.time()
+
+    @property
+    def flashing(self) -> bool:
+        return (time.time() - self._pressed_at) < _FLASH_DUR
+
+
+# ---------------------------------------------------------------------------
+# Teclado Virtual
+# ---------------------------------------------------------------------------
 
 class VirtualKeyboard:
     """
-    Teclado virtual controlado pelo olhar.
+    Teclado virtual QWERTY centralizado na tela.
 
-    O usuário seleciona uma tecla fixando o olhar nela por `dwell_time` segundos.
+    Ocupa 65 % da largura × 55 % da altura do monitor, centrado.
+    Teclas maiores facilitam a seleção por dwell time.
+
+    update(cx, cy) — recebe posição do olhar em PIXELS a cada frame.
+    draw(canvas)   — desenha teclado + área de texto no canvas.
     """
+
+    _TEXT_H = 88
+    _GAP    = 6
 
     def __init__(
         self,
-        frame_width: int = 1280,
-        frame_height: int = 720,
-        dwell_time: float = 1.5,
-        on_key_press: Optional[Callable[[str], None]] = None,
+        screen_width:   int   = 1280,
+        screen_height:  int   = 720,
+        dwell_time:     float = 1.5,
+        on_speak:       Optional[Callable[[str], None]] = None,
+        right_reserved: int   = 0,   # mantido para compatibilidade — não utilizado
     ) -> None:
-        self.frame_width = frame_width
-        self.frame_height = frame_height
-        self.dwell_time = dwell_time
-        self.on_key_press = on_key_press
+        self.sw          = screen_width
+        self.sh          = screen_height
+        self.dwell_time  = dwell_time
+        self.on_speak    = on_speak
+        self.text_buffer = ""
 
-        self.text_buffer: str = ""
-        self._keys: List[Key] = []
-        self._hovered_key: Optional[Key] = None
-        self._hover_start: float = 0.0
+        self._keys:    List[_Key]     = []
+        self._hover:   Optional[_Key] = None
+        self._hover_t: float          = 0.0
 
-        self._build_layout()
-        logger.info("Teclado virtual inicializado (dwell_time={}s)", dwell_time)
+        # Geometria do widget (preenchida em _build)
+        self._wx = self._wy = 0
+        self._ww = screen_width
+        self._wh = screen_height
+        self._kb_top_y = screen_height - 400
 
-    def _build_layout(self) -> None:
-        """Constrói a grade de teclas baseada nas dimensões do frame."""
-        key_h = 60
-        key_margin = 4
-        keyboard_top = self.frame_height - (len(KEYBOARD_LAYOUT) * (key_h + key_margin)) - 20
+        self._build()
+        logger.info(
+            "VirtualKeyboard {}×{} dwell={:.1f}s widget={}×{}",
+            screen_width, screen_height, dwell_time,
+            int(screen_width * 0.65), int(screen_height * 0.55),
+        )
 
-        for row_i, row in enumerate(KEYBOARD_LAYOUT):
-            y = keyboard_top + row_i * (key_h + key_margin)
-            # Teclas especiais têm largura maior
-            normal_keys = [k for k in row if k not in ("ESPAÇO", "FALAR")]
-            special_keys = [k for k in row if k in ("ESPAÇO", "FALAR")]
+    # ------------------------------------------------------------------
+    # Propriedade pública
+    # ------------------------------------------------------------------
 
-            cols = len(normal_keys) + len(special_keys) * 2  # Especiais = 2x largura
-            key_w = (self.frame_width - 2 * 20 - (len(row) - 1) * key_margin) // cols
+    @property
+    def keyboard_top(self) -> int:
+        return self._kb_top_y
 
-            x = 20
-            for key_label in row:
-                w = key_w * 2 if key_label in ("ESPAÇO", "FALAR") else key_w
-                self._keys.append(Key(label=key_label, x=x, y=y, width=w, height=key_h))
-                x += w + key_margin
+    # ------------------------------------------------------------------
+    # Layout
+    # ------------------------------------------------------------------
+
+    def _build(self) -> None:
+        n_rows = len(KEYBOARD_ROWS)
+
+        # Widget centrado: 65 % largura × 55 % altura
+        self._ww = int(self.sw * 0.65)
+        self._wh = int(self.sh * 0.55)
+        self._wx = (self.sw - self._ww) // 2
+        self._wy = (self.sh - self._wh) // 2
+
+        # Área de teclas: abaixo da área de texto
+        kb_top    = self._wy + self._TEXT_H + 8
+        kb_avail  = self._wh - self._TEXT_H - 8
+        gap_total = (n_rows - 1) * self._GAP
+        key_h     = max(55, (kb_avail - gap_total) // n_rows)
+        self._kb_top_y = kb_top
+
+        self._keys.clear()
+        for ri, row in enumerate(KEYBOARD_ROWS):
+            y      = kb_top + ri * (key_h + self._GAP)
+            n_wide = sum(1 for k in row if k in _WIDE)
+            n_norm = len(row) - n_wide
+            units  = n_norm + n_wide * 3
+            gaps_w = (len(row) - 1) * self._GAP
+            unit_w = (self._ww - gaps_w) / max(units, 1)
+
+            x = self._wx
+            for label in row:
+                w = int(unit_w * (3 if label in _WIDE else 1))
+                self._keys.append(_Key(label=label, x=x, y=y, w=w, h=key_h))
+                x += w + self._GAP
+
+    # ------------------------------------------------------------------
+    # Atualização
+    # ------------------------------------------------------------------
 
     def update(self, gaze_x: float, gaze_y: float) -> None:
-        """
-        Atualiza o estado do teclado com a posição do olhar.
-
-        Args:
-            gaze_x: Posição X normalizada (0.0–1.0)
-            gaze_y: Posição Y normalizada (0.0–1.0)
-        """
-        hovered = None
+        hovered: Optional[_Key] = None
         for key in self._keys:
-            if key.contains(gaze_x, gaze_y, self.frame_width, self.frame_height):
+            if key.hit(gaze_x, gaze_y):
                 hovered = key
                 break
 
-        if hovered != self._hovered_key:
-            self._hovered_key = hovered
-            self._hover_start = time.time()
+        if hovered is not self._hover:
+            self._hover   = hovered
+            self._hover_t = time.time()
             return
 
-        if hovered and (time.time() - self._hover_start) >= self.dwell_time:
-            self._press_key(hovered)
-            self._hover_start = time.time()  # Evita pressionar múltiplas vezes
+        if hovered and (time.time() - self._hover_t) >= self.dwell_time:
+            self._activate(hovered)
+            self._hover_t = time.time()
 
-    def _press_key(self, key: Key) -> None:
-        """Processa o pressionamento de uma tecla."""
-        label = key.label
-        if label == "⌫":
-            self.text_buffer = self.text_buffer[:-1]
-        elif label == "↵":
-            self.text_buffer += "\n"
-        elif label == "ESPAÇO":
-            self.text_buffer += " "
-        elif label == "FALAR":
-            logger.info("TTS: '{}'", self.text_buffer)
-            if self.on_key_press:
-                self.on_key_press(f"__SPEAK__:{self.text_buffer}")
-            self.text_buffer = ""
+    # ------------------------------------------------------------------
+    # Ativação
+    # ------------------------------------------------------------------
+
+    def _activate(self, key: _Key) -> None:
+        key.flash()
+        lbl = key.label
+
+        if   lbl == "APAGAR": self.text_buffer = self.text_buffer[:-1]
+        elif lbl == "ENTER":  self.text_buffer += "\n"
+        elif lbl == "ESPACO": self.text_buffer += " "
+        elif lbl == "LIMPAR": self.text_buffer = ""
+        elif lbl == "FALAR":
+            text = self.text_buffer.strip()
+            logger.info("TTS acionado: '{}'", text)
+            if text and self.on_speak:
+                self.on_speak(text)
             return
         else:
-            self.text_buffer += label
+            self.text_buffer += lbl
 
-        logger.debug("Tecla pressionada: '{}' | Buffer: '{}'", label, self.text_buffer)
-        if self.on_key_press:
-            self.on_key_press(label)
+        logger.debug("Tecla='{}' | buffer='{}'", lbl, self.text_buffer)
 
-    def draw(self, frame: np.ndarray) -> np.ndarray:
-        """Desenha o teclado no frame."""
+    # ------------------------------------------------------------------
+    # Desenho
+    # ------------------------------------------------------------------
+
+    def draw(self, canvas: np.ndarray) -> np.ndarray:
+        self._draw_text_area(canvas)
+        self._draw_keys(canvas)
+        return canvas
+
+    def _draw_text_area(self, canvas: np.ndarray) -> None:
+        x0, y0 = self._wx, self._wy
+        x1, y1 = self._wx + self._ww, self._wy + self._TEXT_H
+
+        cv2.rectangle(canvas, (x0, y0), (x1, y1), _C_DBG, -1)
+        cv2.rectangle(canvas, (x0, y0), (x1, y1), (90, 90, 90), 2)
+        cv2.putText(canvas, "Texto:", (x0 + 14, y0 + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (120, 120, 120), 1)
+
+        text      = self.text_buffer.replace("\n", " | ")
+        cursor    = "|" if int(time.time() * 2) % 2 == 0 else ""
+        full      = text + cursor
+        max_chars = max(1, (x1 - x0 - 30) // 15)
+        tail      = full[-max_chars:] if len(full) > max_chars else full
+        if not text:
+            tail = cursor or "_"
+
+        cv2.putText(canvas, tail, (x0 + 18, y1 - 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.90, _C_DBT, 2)
+
+    def _draw_keys(self, canvas: np.ndarray) -> None:
         now = time.time()
-
         for key in self._keys:
-            is_hovered = key == self._hovered_key
-            color = COLOR_KEY_HOVER if is_hovered else COLOR_KEY_BG
+            is_hover = key is self._hover
+            is_flash = key.flashing
 
-            # Fundo da tecla
-            cv2.rectangle(frame, (key.x, key.y), (key.x + key.width, key.y + key.height), color, -1)
-            cv2.rectangle(frame, (key.x, key.y), (key.x + key.width, key.y + key.height), (100, 100, 100), 1)
+            bg     = _C_FLASH if is_flash else (_C_HOVER if is_hover else _C_KEY)
+            border = (160, 160, 160) if is_hover else (75, 75, 75)
 
-            # Barra de progresso (dwell)
-            if is_hovered:
-                progress = min(1.0, (now - self._hover_start) / self.dwell_time)
-                bar_w = int(key.width * progress)
-                cv2.rectangle(
-                    frame,
-                    (key.x, key.y + key.height - 4),
-                    (key.x + bar_w, key.y + key.height),
-                    COLOR_PROGRESS,
-                    -1,
-                )
+            cv2.rectangle(canvas, (key.x, key.y), (key.x + key.w, key.y + key.h), bg, -1)
+            cv2.rectangle(canvas, (key.x, key.y), (key.x + key.w, key.y + key.h), border, 1)
 
-            # Texto da tecla
-            font_scale = 0.5 if len(key.label) > 2 else 0.7
-            text_size = cv2.getTextSize(key.label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)[0]
-            tx = key.center[0] - text_size[0] // 2
-            ty = key.center[1] + text_size[1] // 2
-            cv2.putText(frame, key.label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, font_scale, COLOR_TEXT, 1)
+            if is_hover and not is_flash:
+                prog  = min(1.0, (now - self._hover_t) / self.dwell_time)
+                bar_w = int(key.w * prog)
+                if bar_w > 0:
+                    cv2.rectangle(
+                        canvas,
+                        (key.x,         key.y + key.h - 5),
+                        (key.x + bar_w, key.y + key.h),
+                        _C_PROG, -1,
+                    )
 
-        # Buffer de texto
-        cv2.rectangle(frame, (20, 10), (self.frame_width - 20, 70), (30, 30, 30), -1)
-        cv2.putText(
-            frame,
-            self.text_buffer[-80:] or "_",  # Mostra últimos 80 chars
-            (30, 50),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            COLOR_TEXT,
-            2,
-        )
-        return frame
+            lbl = key.label
+            fs  = (0.80 if len(lbl) == 1 else
+                   0.72 if len(lbl) <= 3 else
+                   0.65 if lbl in _WIDE else 0.52)
+
+            (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, fs, 2)
+            cv2.putText(canvas, lbl,
+                        (key.cx - tw // 2, key.cy + th // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, fs, _C_TXT, 2)
