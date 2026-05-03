@@ -15,6 +15,7 @@ Camada 5  Saída suave:
 import json
 import os
 import random
+import threading
 import time
 from collections import deque
 from dataclasses import asdict, dataclass
@@ -466,9 +467,9 @@ def _run_phase0(
 
     # ── Detecção de olho dominante (maior correlação com target) ──────────────
     dominant = "left"
-    n_h = min(len(h_tgt), len(l_h), len(r_h))
+    n_h = min(len(tgts_h), len(l_h), len(r_h))
     if n_h >= 10:
-        t_arr = np.array(h_tgt[:n_h])
+        t_arr = np.array([v[0] for v in tgts_h[:n_h]])
         lx    = np.array([v[0] for v in l_h[:n_h]])
         rx    = np.array([v[0] for v in r_h[:n_h]])
         cl    = abs(float(np.corrcoef(t_arr, lx)[0, 1])) if np.std(lx) > 1e-8 else 0.0
@@ -801,10 +802,13 @@ class CalibrationSession:
     WIN         = "IrisFlow"
     TRAJ_WEIGHT = 0.15
 
-    def __init__(self, tracker: IrisTracker) -> None:
-        self.tracker = tracker
+    def __init__(self, tracker: IrisTracker, settings=None, bridge=None) -> None:
+        self.tracker      = tracker
+        self._settings    = settings
+        self._bridge      = bridge
+        self._start_event = threading.Event()
         self._sw, self._sh = self._screen_size()
-        self.model   = GazeModel()
+        self.model        = GazeModel()
 
     @staticmethod
     def _screen_size() -> Tuple[int, int]:
@@ -956,7 +960,8 @@ class CalibrationSession:
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q") or not self._alive():
                 return False
-            if key == ord("r"):
+            if key == ord("r") or self._start_event.is_set():
+                self._start_event.clear()
                 return True
 
     # ── Fluxo Principal ───────────────────────────────────────────────────────

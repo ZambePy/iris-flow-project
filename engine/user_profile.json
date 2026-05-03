@@ -1,9 +1,9 @@
 {
-  "gaze_x_min": -1.3038204750228655,
-  "gaze_x_max": 1.0628933545818264,
-  "gaze_y_min": 0.5367920978839326,
-  "gaze_y_max": 1.0364540365707555,
-  "variance": 0.006838943050691474,
-  "dominant": "left",
-  "has_glasses": false
+  "gaze_x_min": -1.0123186897853782,
+  "gaze_x_max": 1.005920692058297,
+  "gaze_y_min": 0.07376304161299398,
+  "gaze_y_max": 0.20692911326063565,
+  "variance": 0.09803054827854032,
+  "dominant": "right",
+  "has_glasses": true
 }
