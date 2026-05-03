@@ -1021,8 +1021,71 @@ class CalibrationSession:
                     weights += [self.TRAJ_WEIGHT] * len(feats2)
                     logger.info("Fase 2: {} amostras.", len(feats2))
 
-                # ── Ajuste do modelo ──────────────────────────────────────────
-                if not self.model.fit(feats1 + feats2, pos1 + pos2, weights):
+                # ── Ajuste do modelo com prior MPIIGaze + histórico ──────────
+                from calib_store import load_historical, save_session
+
+                # 1. Histórico de sessões anteriores do mesmo paciente
+                hist_feats, hist_pos, hist_weights = load_historical(
+                    max_sessions=5,
+                    decay=0.60,
+                    max_error_px=120.0,
+                )
+                logger.info("Histórico: {} pontos de sessões anteriores.", len(hist_feats))
+
+                # 2. Prior MPIIGaze (prior_gaze.npy gerado pelo scripts/build_prior.py)
+                prior_feats:   list = []
+                prior_pos:     list = []
+                prior_weights: list = []
+
+                _prior_path = os.path.join(os.path.dirname(__file__), "prior_gaze.npy")
+                if os.path.exists(_prior_path):
+                    try:
+                        prior_data = np.load(_prior_path, allow_pickle=True).item()
+                        p_feats    = prior_data["features"]
+                        p_poses    = prior_data["positions"]
+                        p_weight   = float(prior_data["weight"])
+
+                        gx_range   = max(profile.gaze_x_max - profile.gaze_x_min, 1e-5)
+                        gy_range   = max(profile.gaze_y_max - profile.gaze_y_min, 1e-5)
+                        p_gx_range = max(float(prior_data["gx_max"]) - float(prior_data["gx_min"]), 1e-5)
+                        p_gy_range = max(float(prior_data["gy_max"]) - float(prior_data["gy_min"]), 1e-5)
+
+                        for feat, pos in zip(p_feats, p_poses):
+                            nx = (feat[0] - float(prior_data["gx_min"])) / p_gx_range
+                            ny = (feat[1] - float(prior_data["gy_min"])) / p_gy_range
+
+                            mapped = np.array([
+                                nx * gx_range + profile.gaze_x_min,
+                                ny * gy_range + profile.gaze_y_min,
+                            ], dtype=np.float64)
+                            norm = profile.normalize(mapped)
+
+                            prior_feats.append(norm)
+                            prior_pos.append((float(pos[0]), float(pos[1])))
+                            prior_weights.append(p_weight)
+
+                        logger.info("Prior MPIIGaze carregado: {} pontos (peso={}).",
+                                    len(prior_feats), p_weight)
+                    except Exception as e:
+                        logger.warning("Falha ao carregar prior MPIIGaze: {}", e)
+                else:
+                    logger.info("prior_gaze.npy não encontrado — rodando sem prior. "
+                                "Execute scripts/build_prior.py para gerar.")
+
+                # 3. Combina: sessão atual + histórico + prior
+                all_feats   = feats1 + feats2 + hist_feats   + prior_feats
+                all_pos     = pos1   + pos2   + hist_pos     + prior_pos
+                all_weights = weights         + hist_weights + prior_weights
+
+                logger.info(
+                    "model.fit(): {} pts sessão + {} histórico + {} prior = {} total",
+                    len(feats1) + len(feats2),
+                    len(hist_feats),
+                    len(prior_feats),
+                    len(all_feats),
+                )
+
+                if not self.model.fit(all_feats, all_pos, all_weights):
                     logger.error("Falha no ajuste do modelo.")
                     return
                 self.model.reset_smoothing()
@@ -1041,6 +1104,21 @@ class CalibrationSession:
                     cv2.imshow(self.WIN, canvas)
                     if cv2.waitKey(0) & 0xFF == ord("r"):
                         continue
+
+                # ── Salvar sessão no histórico ────────────────────────────────
+                try:
+                    from calib_store import save_session
+                    save_session(
+                        profile  = profile,
+                        feats1   = feats1,
+                        pos1     = pos1,
+                        feats2   = feats2,
+                        pos2     = pos2,
+                        error_px = avg_err,
+                    )
+                    logger.info("Sessão salva no histórico (erro={:.0f}px).", avg_err)
+                except Exception as e:
+                    logger.warning("Falha ao salvar sessão: {}", e)
 
                 # ── Rastreamento ao vivo ──────────────────────────────────────
                 if not self._run_tracking(profile):

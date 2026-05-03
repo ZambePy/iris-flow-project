@@ -12,15 +12,224 @@ voluntário. Clínicas de reabilitação, hospitais e famílias de pacientes.
 **Diferencial principal:** Funciona em webcam comum (sem hardware proprietário). Custo 10x menor
 que concorrentes como Tobii Dynavox (R$ 15k–80k).
 
+**Meta imediata:** Demo funcional na AACD (Associação de Assistência à Criança Deficiente)
+em até 70 dias. Paciente real usa o sistema ao vivo na frente da equipe clínica.
+
 ---
 
 ## Time
 
 | Pessoa | Papel |
 |--------|-------|
-| Dev 1 (você) | Backend Python, engine de IA, API, integração |
+| Gabriel | Backend Python, engine de IA, API, integração |
 | Marcus | Backend Python, engine de IA, API, integração |
 | Vinicius | Modelo de negócios, marketing, vendas |
+
+---
+
+## Estado atual do projeto (maio 2026)
+
+O engine de rastreamento está implementado e funcional. O que existe:
+
+| Arquivo | Status | Descrição |
+|---------|--------|-----------|
+| `engine/iris_tracker.py` | ✅ Completo | MediaPipe + head pose 6DoF + gaze 3D + Kalman |
+| `engine/calibration.py` | ⚠️ Funcional, otimizar | 3 fases: varredura + 9 pontos + trajetórias |
+| `engine/calib_store.py` | ✅ Completo | SQLite — persiste sessões de calibração |
+| `engine/virtual_keyboard.py` | ⚠️ Funcional, melhorar | QWERTY com dwell time fixo |
+| `engine/tts.py` | ✅ Completo | Coqui TTS + pyttsx3 fallback |
+| `api/main.py` | 🔧 Estrutura | FastAPI básico, rotas vazias |
+| `engine/user_profile.json` | ✅ Gerado | Perfil ocular por paciente |
+| `engine/calibration.db` | ✅ Gerado | Histórico de sessões SQLite |
+
+O que ainda não existe e precisa ser criado:
+
+- `engine/quick_comm.py` — painel de comunicação rápida (8 botões emocionais)
+- `engine/word_predict.py` — predição de palavras PT-BR local
+- `engine/metrics.py` — métricas clínicas por sessão
+- Modo cuidador via FastAPI + HTML simples
+- Installer Windows (PyInstaller + NSIS)
+
+---
+
+## Plano de 70 dias — Sprints
+
+### Sprint 1 · Dias 1–17 · Destravar calibração + dwell click
+
+**Problema a resolver:** calibração demora demais para pacientes com condições progressivas.
+Fase 0 (10s de varredura) + Fase 2 (trajetórias opcionais mas longas) = frustração clínica.
+
+**Tarefas:**
+
+1. **Calibração rápida** (`engine/calibration.py`)
+   - Fase 0: reduzir `SWEEP_FRAMES` de 150 para 90 (3s por sweep em vez de 5s)
+   - Fase 1: reduzir `COUNTDOWN` de 2.0s para 1.2s e `COLLECT` de 1.5s para 1.0s
+   - Fase 2: tornar pulada por padrão — mostrar `[T]` para ativar trajetórias, `[SPACE]` para pular
+   - Auto-recalibração silenciosa: a cada 300 frames no `_run_tracking()`, coletar 1 amostra
+     e re-ajustar o modelo com histórico — corrige drift sem interromper o usuário
+
+2. **Calibração cruzada com histórico** (`engine/calibration.py`)
+   - Após Fase 1 (e Fase 2 se ativada), chamar `calib_store.load_historical()` e combinar
+     pontos históricos com pontos da sessão atual antes de chamar `model.fit()`
+   - Sessões mais antigas têm peso menor (decay=0.60 já implementado no calib_store)
+   - Salvar sessão no `calib_store` após calibração bem-sucedida (`save_session()`)
+   - Isso resolve a imprecisão nas bordas/cantos que a grade 3×3 não cobre bem
+
+3. **Dwell click inteligente** (`engine/virtual_keyboard.py`)
+   - Dwell adaptativo por tipo de tecla: letras=1.2s, teclas largas (ESPACO/FALAR/LIMPAR)=0.8s,
+     ações destrutivas (APAGAR/LIMPAR)=1.5s
+   - Hitbox expandida: +20% na área de hit sem mudar visual (reduz esforço ocular)
+   - Intent check: só ativar se olhar ficou nos últimos 3 frames dentro da hitbox
+     (evita ativação acidental ao passar por cima)
+   - Barra de progresso mais visível: 8px de altura, cor azul→verde conforme progride
+
+**Entregável do Sprint 1:** sistema roda 10 minutos contínuos com 1 paciente real sem travar
+ou exigir recalibração manual.
+
+---
+
+### Sprint 2 · Dias 18–34 · Comunicação rápida + predição de palavras
+
+**Tarefas:**
+
+1. **Painel de comunicação rápida** (`engine/quick_comm.py` — criar do zero)
+   - 8 botões gigantes (ocupam 70% da tela): Dor, Desconforto, Fome, Água, Frio, Calor,
+     Ajuda, Emergência
+   - 1 olhar prolongado (dwell 0.8s) → dispara alerta sonoro + mensagem no log
+   - Alternável com o teclado via botão de contexto
+   - Este módulo tem mais impacto clínico imediato que o teclado completo
+
+2. **Predição de palavras PT-BR** (`engine/word_predict.py` — criar do zero)
+   - Modelo n-gram treinado localmente (sem internet, sem API)
+   - Sugerir top 3 palavras acima do teclado
+   - Memória de frases frequentes por paciente (salvar em `user_profile.json`)
+   - Integrar ao `VirtualKeyboard` como linha extra de sugestões
+
+3. **Anti-fadiga ocular** (`engine/calibration.py` — camada 5)
+   - Magnetismo de alvo: expandir hitbox invisível em +40% para elementos próximos ao olhar
+   - Pausa automática configurável após N minutos de uso contínuo
+   - Cooldown visual: reduzir brilho da tela em 20% após 15 min de uso
+
+**Entregável do Sprint 2:** paciente comunica necessidade básica (água, dor) em menos de 3s
+sem precisar do cuidador.
+
+---
+
+### Sprint 3 · Dias 35–51 · Perfil adaptativo + modo cuidador
+
+**Tarefas:**
+
+1. **Perfil adaptativo por paciente** (`engine/calib_store.py` + `user_profile.json`)
+   - Expandir `user_profile.json` para registrar: dwell ideal por sessão, nível de fadiga
+     médio, frases mais usadas, horário de maior precisão
+   - O sistema aprende e ajusta automaticamente dwell_time e sensibilidade por sessão
+   - Detectar degradação de precisão (drift acima do threshold) e sugerir recalibração
+
+2. **Modo cuidador** (`api/` — usar FastAPI existente)
+   - Interface web simples (HTML + FastAPI, sem Next.js ainda) acessível pelo celular do
+     cuidador na mesma rede Wi-Fi
+   - Funcionalidades: configurar frases rápidas, ajustar dwell_time, ver log de uso em
+     tempo real, acionar recalibração remotamente
+   - Rota WebSocket já existe no `api/` — usar para live updates
+
+**Entregável do Sprint 3:** cuidador configura frases e sensibilidade pelo celular sem tocar
+no PC do paciente.
+
+---
+
+### Sprint 4 · Dias 52–70 · Métricas clínicas + demo AACD
+
+**Tarefas:**
+
+1. **Métricas clínicas** (`engine/metrics.py` — criar do zero)
+   - Registrar por sessão: estabilidade ocular (desvio padrão da posição), tempo médio de
+     resposta por tecla, número de ativações acidentais, fadiga ao longo do tempo
+   - Exportar relatório PDF simples para o clínico (usar reportlab ou fpdf2)
+   - Dados ficam 100% locais (LGPD) — nunca sobem para nuvem
+
+2. **Garantia offline** (revisar todos os módulos)
+   - Remover qualquer dependência de rede do loop principal (TTS, predição, calibração)
+   - TTS: garantir que pyttsx3 funciona como fallback quando Coqui falha
+   - Predição: modelo n-gram roda 100% local, sem chamada OpenAI
+
+3. **Installer Windows** (PyInstaller + NSIS)
+   - Gerar `.exe` com um clique — sem precisar instalar Python
+   - Testar em máquina limpa (sem `.venv`)
+   - Script de demo de 5 minutos documentado para o cuidador apresentar à equipe clínica
+
+**Entregável do Sprint 4:** demo ao vivo na AACD — paciente usa o sistema na frente da equipe,
+cuidador mostra o painel pelo celular, clínico vê as métricas de precisão.
+
+---
+
+## Fora do escopo dos 70 dias — não implementar agora
+
+As funcionalidades abaixo são importantes mas entram **após** o feedback clínico da AACD:
+
+- Clonagem de voz (TTS com voz do paciente)
+- Integração Alexa / smart home
+- App mobile React Native
+- Dashboard Next.js completo
+- Stripe / pagamentos
+- Docker em produção
+- Avatar facial
+
+---
+
+## Estratégia de dados e calibração cruzada
+
+### Por que cruzar calibração com histórico
+
+O modelo RBF (`GazeModel`) usa `RBFInterpolator` (thin-plate spline) para mapear
+feature de olhar → posição na tela. Com apenas 9 pontos (grade 3×3), a interpolação é
+fraca nas bordas e cantos. Cruzar com histórico de sessões anteriores resolve isso.
+
+### Como funciona (já arquitetado, falta ligar)
+
+O `calib_store.py` já implementa tudo. A chamada que falta em `calibration.py`:
+
+```python
+from calib_store import load_historical, save_session
+
+# Após fase 1 (e fase 2 se ativada):
+hist_feats, hist_pos, hist_weights = load_historical(
+    max_sessions=5,   # usa até 5 sessões anteriores
+    decay=0.60,       # sessões mais antigas valem menos
+    max_error_px=120, # ignora sessões ruins
+)
+
+# Combina sessão atual + histórico
+all_feats   = feats1 + feats2 + hist_feats
+all_pos     = pos1   + pos2   + hist_pos
+all_weights = weights_atuais  + hist_weights
+
+model.fit(all_feats, all_pos, all_weights)
+
+# Salvar sessão atual após validação
+save_session(profile, feats1, pos1, feats2, pos2, error_px=avg_err)
+```
+
+### Evolução por sessão
+
+| Sessão | Pontos disponíveis | Efeito |
+|--------|--------------------|--------|
+| 1ª | 9 (grade atual) | igual ao atual |
+| 2ª | ~60 (9 + 9×decay) | bordas melhoram |
+| 5ª | ~200+ pontos | modelo já conhece o padrão ocular do paciente |
+
+### Datasets públicos (uso futuro — pós-AACD)
+
+Não usar nos 70 dias. Após ter 20–30 sessões reais de pacientes:
+
+- **GazeCapture** (MIT, gazecapture.csail.mit.edu) — 1.45M frames, 1.450 pessoas.
+  Usar como prior fraco (peso 0.03–0.05) para melhorar a primeira sessão de um paciente
+  novo antes de ter histórico próprio.
+- **MPIIGaze** (perceptualui.org/research/datasets/MPIIGaze) — 213k amostras.
+  Útil para validar que o modelo generaliza além dos pacientes da AACD.
+
+O `calib_store.db` gerado nas sessões da AACD é o ativo mais valioso do projeto —
+são dados de pacientes brasileiros com ELA/tetraplegia usando webcam comum,
+que nenhum concorrente tem.
 
 ---
 
@@ -28,83 +237,60 @@ que concorrentes como Tobii Dynavox (R$ 15k–80k).
 
 ### Engine de IA (Python)
 - **Visão computacional:** MediaPipe Face Mesh + OpenCV 4.x
-- **Calibração adaptativa:** TensorFlow Lite / ONNX Runtime (modelo LSTM leve)
-- **TTS PT-BR:** Coqui TTS (principal), pyttsx3 (fallback)
-- **STT PT-BR:** OpenAI Whisper (self-hosted, modelo "small")
+- **Calibração:** RBFInterpolator (scipy) — thin-plate spline
+- **Suavização:** Filtro de Kalman 2D (filterpy) + deadzone adaptativa + LERP
+- **TTS PT-BR:** Coqui TTS (principal), pyttsx3 (fallback offline)
 - **Linguagem:** Python 3.11+
 
-#### Pipeline de rastreamento (iris_tracker.py — implementado)
+### Pipeline de rastreamento (`iris_tracker.py` — implementado)
 
-**Captura:** câmera a 640×480 para reduzir carga do MediaPipe sem perda de precisão
-(landmarks retornam coordenadas normalizadas [0,1] independente da resolução).
+**Captura:** câmera a 640×480, thread dedicada com `queue.Queue` (sem perda de frames).
 
 **Feature combinada por frame:**
-`ratio = 0.7 × eye_ratio + 0.3 × face_ratio`
 - `eye_ratio`: posição da íris relativa aos cantos ósseos do olho (baseline estável)
-- `face_ratio`: posição da íris relativa ao span lateral da face (~3× mais largo)
-- Ambos suavizados por EMA (α=0.20) antes da combinação
+- `face_ratio`: posição da íris relativa ao span lateral da face
+- Combinados: `ratio = 0.7 × eye_ratio + 0.3 × face_ratio`
 
-**Suavização do cursor:**
-1. EMA α=0.20 sobre o ratio combinado (reduz ruído de alta frequência)
-2. Deadzone adaptativa em espaço normalizado — trava cursor quando olho está parado;
-   válvula de escape após MAX_FROZEN=25 frames para não bloquear movimentos lentos
-3. Filtro de Kalman 2D (velocidade constante + amortecimento 0.85) em pixels
-4. LERP fator 0.10 entre posição atual e alvo do Kalman (deslizamento suave)
-5. Cursor mantém última posição conhecida quando íris não é detectada (sem indicação visual de pausa)
-
-**Calibração híbrida em 2 etapas (~2 minutos no total):**
-- *Etapa 1 — Pontos fixos:* grade 3×3 (9 pontos) + ponto central dedicado com peso 3×
-  e 60 frames de coleta; regressão polinomial (afim/bilinear/quadrática por nº de pontos)
-  com mínimos quadrados ponderados
-- *Etapa 2 — Trajetórias dinâmicas:* 6 padrões de movimento (cruz horizontal, cruz vertical,
-  diagonal Z, figura-8, borda da tela, espiral); coleta 1 amostra a cada 2 frames com
-  compensação de lag oculomotor de 4 frames (~130 ms); ~500 pares (íris→tela) combinados
-  com os 10 pontos fixos (peso 0.10 por amostra de trajetória)
-
-**Óculos:** toggle manual `[G]` na tela de setup — eleva confiança mínima do MediaPipe
-de 0.50 para 0.70, melhorando estabilidade de landmarks sob reflexo de lente.
-Usuários de óculos devem garantir boa iluminação frontal (tela de setup exibe indicador).
+**Pipeline de suavização (5 camadas):**
+1. EMA α=0.20 sobre o ratio combinado
+2. Head pose 6DoF via solvePnP — compensa movimento de cabeça
+3. Deadzone adaptativa — trava cursor quando olho está parado
+4. Filtro de Kalman 2D (velocidade constante + amortecimento 0.85)
+5. LERP 0.08 entre posição atual e alvo do Kalman
 
 ### Backend / API
 - **Framework:** FastAPI
 - **Banco dev:** SQLite → PostgreSQL (Supabase em produção)
-- **Cache:** Redis (a partir do Mês 4, se necessário)
-- **Auth:** Supabase Auth (JWT + OAuth Google)
-- **Pagamentos:** Stripe (assinaturas recorrentes)
+- **Auth:** Supabase Auth (JWT)
+- **Pagamentos:** Stripe (pós-AACD)
 
-### Frontend (Mês 5+)
-- **Framework:** Next.js 14 (React) + Tailwind CSS + shadcn/ui
-- **Deploy:** Vercel (gratuito)
-
-### Infra
-- **Containerização:** Docker + Docker Compose
-- **CI/CD:** GitHub Actions
-- **Deploy backend:** Railway ou Render
-- **Versionamento:** Git + GitHub
+### Frontend (pós-AACD)
+- **Framework:** Next.js 14 + Tailwind CSS + shadcn/ui
+- **Deploy:** Vercel
 
 ---
 
 ## Arquitetura do sistema
 
 ```
-Edge (dispositivo do usuário)
-  └── MediaPipe + OpenCV + modelo LSTM
-      └── Processa câmera localmente (nenhum dado biométrico vai para nuvem)
+Edge (dispositivo do paciente — 100% local)
+  └── iris_tracker.py      → captura + head pose + gaze 3D
+  └── calibration.py       → calibração + modelo RBF + auto-drift
+  └── calib_store.py       → SQLite local (calibration.db)
+  └── virtual_keyboard.py  → teclado + dwell click
+  └── quick_comm.py        → painel emocional (Sprint 2)
+  └── word_predict.py      → predição PT-BR local (Sprint 2)
+  └── tts.py               → síntese de voz offline
+  └── metrics.py           → métricas clínicas (Sprint 4)
 
-Backend (nuvem — Railway + Supabase)
-  └── FastAPI + PostgreSQL + Redis
-      └── Gerencia usuários, licenças, configurações, webhooks Stripe
+Backend (rede local Wi-Fi — modo cuidador)
+  └── api/main.py          → FastAPI WebSocket + rotas de config
+      └── acessível pelo celular do cuidador na mesma rede
 
-Frontend (Vercel)
-  └── Next.js — dashboard de assinantes: ativa licença, gerencia plano, baixa software
-
-Mobile/TV (Mês 5+)
-  └── React Native (mobile) + Android TV app
-      └── Comunicam com edge via WebSocket na mesma rede Wi-Fi
+Nuvem (pós-AACD)
+  └── Supabase + Railway    → usuários, licenças, dashboard
+  └── LGPD: NUNCA sobe biometria ou frames para nuvem
 ```
-
-**Regra crítica de privacidade (LGPD):** Dados da câmera e biometria são processados 100%
-localmente no dispositivo. NUNCA enviar frames ou dados biométricos para a nuvem.
 
 ---
 
@@ -112,77 +298,57 @@ localmente no dispositivo. NUNCA enviar frames ou dados biométricos para a nuve
 
 ```
 irisflow/
-├── engine/                  # Engine de IA e visão computacional (Fase 1)
-│   ├── iris_tracker.py      # MediaPipe + OpenCV: detecção de íris
-│   ├── calibration.py       # Calibração manual e adaptativa (LSTM)
-│   ├── tts.py               # Text-to-speech PT-BR
-│   ├── stt.py               # Speech-to-text (Whisper)
-│   └── virtual_keyboard.py  # Teclado virtual
-├── api/                     # FastAPI backend (Fase 2 — Mês 3)
-│   ├── main.py
+├── engine/
+│   ├── iris_tracker.py      # ✅ Rastreamento: MediaPipe + head pose + gaze
+│   ├── calibration.py       # ⚠️ Calibração — Sprint 1: acelerar + cruzar histórico
+│   ├── calib_store.py       # ✅ SQLite: persiste sessões de calibração
+│   ├── virtual_keyboard.py  # ⚠️ Teclado — Sprint 1: dwell inteligente
+│   ├── tts.py               # ✅ TTS PT-BR
+│   ├── quick_comm.py        # 🔲 Criar no Sprint 2
+│   ├── word_predict.py      # 🔲 Criar no Sprint 2
+│   ├── metrics.py           # 🔲 Criar no Sprint 4
+│   ├── user_profile.json    # ✅ Perfil ocular por paciente
+│   └── calibration.db       # ✅ Histórico de sessões
+├── api/
+│   ├── main.py              # ✅ FastAPI base
 │   ├── models.py
 │   ├── database.py
-│   └── routes/
-│       ├── auth.py
-│       ├── users.py
-│       └── subscriptions.py
-├── dashboard/               # Next.js (Fase 3 — Mês 5)
-├── tests/                   # pytest
-├── docs/                    # Documentação técnica
+│   └── routes/              # 🔲 Modo cuidador — Sprint 3
+├── tests/
+├── docs/
+├── main.py                  # Entry point
 ├── docker-compose.yml
 ├── requirements.txt
-├── .env.example
-└── README.md
+└── .env.example
 ```
-
----
-
-## Cronograma resumido
-
-| Fase | Meses | Foco |
-|------|-------|------|
-| 1 — Fundação + Engine | 1–2 | MediaPipe, calibração, teclado virtual, TTS |
-| 2 — Backend + API | 3–4 | FastAPI, Supabase, Stripe, Whisper, Docker |
-| 3 — Dashboard + MVP | 5–6 | Next.js, landing page, deploy produção |
-| 4 — Mobile + TV | 7 | React Native, Android TV, pitch final |
 
 ---
 
 ## Convenções de código
 
 - **Python:** PEP 8, type hints em todas as funções, docstrings em PT-BR
-- **Commits:** mensagens em inglês no imperativo (`feat: add iris tracker`, `fix: calibration offset`)
-- **Branches:** `feature/nome-da-feature`, `fix/nome-do-bug`, `chore/nome-da-tarefa`
-- **Pull Requests:** sempre revisar antes de mergear na `main`
-- **Testes:** pytest, manter cobertura > 70% nos módulos críticos
-- **Variáveis de ambiente:** nunca hardcodar segredos, sempre usar `.env`
-
----
-
-## Variáveis de ambiente necessárias
-
-Ver `.env.example` para lista completa. As principais:
-
-- `SUPABASE_URL` e `SUPABASE_KEY` — banco e auth
-- `STRIPE_SECRET_KEY` e `STRIPE_WEBHOOK_SECRET` — pagamentos
-- `DATABASE_URL` — string de conexão (SQLite em dev, Postgres em prod)
+- **Commits:** mensagens em inglês no imperativo (`feat: add dwell intent check`)
+- **Branches:** `feature/nome`, `fix/nome`, `chore/nome`
+- **Testes:** pytest, cobertura > 70% nos módulos críticos
+- **Segredos:** nunca hardcodar, sempre usar `.env`
+- **LGPD:** dados biométricos (frames, posição de íris) NUNCA saem do dispositivo local
 
 ---
 
 ## Comandos úteis
 
 ```bash
-# Rodar engine localmente (Windows — usar sempre o .venv)
-.venv/Scripts/python.exe engine/iris_tracker.py
+# Rodar engine (Windows)
+.venv\Scripts\python.exe engine/iris_tracker.py
 
-# Rodar API em desenvolvimento
+# Rodar engine (Linux/macOS)
+python engine/iris_tracker.py
+
+# Rodar API
 uvicorn api.main:app --reload
 
 # Rodar testes
 pytest tests/ -v
-
-# Subir ambiente completo com Docker
-docker-compose up
 
 # Instalar dependências
 pip install -r requirements.txt
@@ -193,7 +359,8 @@ pip install -r requirements.txt
 ## Contexto de negócio
 
 - **Modelo:** B2B (clínicas/hospitais) + B2C (famílias)
-- **Preço:** ~R$ 79/mês por assinante, licença institucional para clínicas
-- **Meta:** 10.000 usuários ativos até 2030
-- **Custo total estimado (7 meses):** ~R$ 2.360
-- **Infra inicial:** gratuita (Railway free tier + Supabase free tier + Vercel)
+- **Preço:** R$ 79/mês familiar, R$ 349/mês clínica, R$ 1.490/mês hospitalar
+- **Meta 2030:** 10.000 usuários ativos
+- **Custo MVP:** ~R$ 1.555 (desenvolvimento = time próprio)
+- **Infra inicial:** gratuita (Railway + Supabase + Vercel free tiers)
+- **Próximo marco:** demo AACD em 70 dias → feedback clínico real → iterar
