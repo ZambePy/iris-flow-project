@@ -36,6 +36,15 @@ _C_DBT   = (255, 255, 255)
 _FLASH_DUR = 0.35
 
 
+def _dwell_for(label: str) -> float:
+    """Retorna o dwell time em segundos para o tipo de tecla."""
+    if label in {"ESPACO", "FALAR", "LIMPAR"}:
+        return 0.8
+    if label in {"APAGAR", "ENTER"}:
+        return 1.5
+    return 1.2
+
+
 # ---------------------------------------------------------------------------
 # Tecla
 # ---------------------------------------------------------------------------
@@ -50,7 +59,10 @@ class _Key:
         self._pressed_at = 0.0
 
     def hit(self, px: float, py: float) -> bool:
-        return self.x <= px <= self.x + self.w and self.y <= py <= self.y + self.h
+        ex = self.w * 0.10
+        ey = self.h * 0.10
+        return (self.x - ex) <= px <= (self.x + self.w + ex) and \
+               (self.y - ey) <= py <= (self.y + self.h + ey)
 
     @property
     def cx(self) -> int:
@@ -100,9 +112,10 @@ class VirtualKeyboard:
         self.on_speak    = on_speak
         self.text_buffer = ""
 
-        self._keys:    List[_Key]     = []
-        self._hover:   Optional[_Key] = None
-        self._hover_t: float          = 0.0
+        self._keys:         List[_Key]          = []
+        self._hover:        Optional[_Key]      = None
+        self._hover_t:      Optional[float]     = None
+        self._hover_frames: int                 = 0
 
         # Geometria do widget (preenchida em _build)
         self._wx = self._wy = 0
@@ -172,13 +185,24 @@ class VirtualKeyboard:
                 break
 
         if hovered is not self._hover:
-            self._hover   = hovered
-            self._hover_t = time.time()
+            self._hover        = hovered
+            self._hover_t      = None
+            self._hover_frames = 0
             return
 
-        if hovered and (time.time() - self._hover_t) >= self.dwell_time:
-            self._activate(hovered)
+        if hovered is None:
+            return
+
+        self._hover_frames += 1
+        if self._hover_frames == 3:
             self._hover_t = time.time()
+
+        if self._hover_t is not None:
+            dt = _dwell_for(hovered.label)
+            if (time.time() - self._hover_t) >= dt:
+                self._activate(hovered)
+                self._hover_t      = time.time()
+                self._hover_frames = 0
 
     # ------------------------------------------------------------------
     # Ativação
@@ -244,15 +268,21 @@ class VirtualKeyboard:
             cv2.rectangle(canvas, (key.x, key.y), (key.x + key.w, key.y + key.h), bg, -1)
             cv2.rectangle(canvas, (key.x, key.y), (key.x + key.w, key.y + key.h), border, 1)
 
-            if is_hover and not is_flash:
-                prog  = min(1.0, (now - self._hover_t) / self.dwell_time)
+            if is_hover and not is_flash and self._hover_t is not None:
+                dt    = _dwell_for(key.label)
+                prog  = min(1.0, (now - self._hover_t) / dt)
                 bar_w = int(key.w * prog)
                 if bar_w > 0:
+                    bar_color = (
+                        0,
+                        int(210 + 10 * prog),
+                        int(255 - 175 * prog),
+                    )
                     cv2.rectangle(
                         canvas,
-                        (key.x,         key.y + key.h - 5),
+                        (key.x,         key.y + key.h - 8),
                         (key.x + bar_w, key.y + key.h),
-                        _C_PROG, -1,
+                        bar_color, -1,
                     )
 
             lbl = key.label

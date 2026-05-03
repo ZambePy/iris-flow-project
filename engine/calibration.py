@@ -59,6 +59,13 @@ class GazeProfile:
     variance:    float =  0.001
     dominant:    str   = "left"
     has_glasses: bool  = False
+    # Geometria física do setup
+    monitor_inches:    float = 15.6
+    camera_position:   str   = "top"
+    distance_cm:       float = 60.0
+    vertical_offset:   float = 0.0
+    horizontal_offset: float = 0.0
+    setup_configured:  bool  = False
 
     def normalize(self, gaze: np.ndarray) -> np.ndarray:
         """Escala gaze_feature para [0, 1] baseado no range aprendido."""
@@ -375,7 +382,7 @@ def _run_phase0(
     Varredura H (5s) + V (5s): aprende range de gaze, detecta óculos e olho dominante.
     """
 
-    SWEEP_FRAMES = 150      # ~5s @ 30fps
+    SWEEP_FRAMES = 90       # ~3s @ 30fps
     MARGIN       = 0.05
 
     for ct in range(3, 0, -1):
@@ -529,8 +536,8 @@ def _run_phase1(
         (M,      0.5),   (0.5,    0.5),   (1 - M, 0.5),
         (M,      1 - M), (0.5,    1 - M), (1 - M, 1 - M),
     ]
-    COUNTDOWN = 2.0
-    COLLECT   = 1.5
+    COUNTDOWN = 1.2
+    COLLECT   = 1.0
 
     feats:    List[np.ndarray]          = []
     pos_list: List[Tuple[float, float]] = []
@@ -727,16 +734,22 @@ def _run_validation(
     model:   GazeModel,
     sw: int, sh: int,
     win: str,
-) -> float:
-    """3 pontos fora do grid de calibração; mede erro médio em pixels."""
+) -> Tuple[float, float, float]:
+    """
+    3 pontos fora do grid de calibração; mede erro médio em pixels.
+    Retorna (avg_err, sys_dx, sys_dy) onde sys_dx/dy são offsets normalizados
+    detectados como erro sistemático (positivo = cursor à direita/abaixo do alvo).
+    """
 
     VAL_POOL = [
         (0.20, 0.25), (0.80, 0.20), (0.50, 0.12),
         (0.15, 0.65), (0.85, 0.72), (0.45, 0.82),
         (0.72, 0.48), (0.28, 0.78), (0.62, 0.18),
     ]
-    pts    = random.sample(VAL_POOL, 3)
-    errors: List[float] = []
+    pts     = random.sample(VAL_POOL, 3)
+    errors: List[float]              = []
+    err_vx: List[float]              = []
+    err_vy: List[float]              = []
 
     for i, pos in enumerate(pts):
         px, py    = int(pos[0] * sw), int(pos[1] * sh)
@@ -761,34 +774,93 @@ def _run_validation(
             cv2.circle(canvas, (px, py),  5, (0,  100, 255), -1)
             cv2.imshow(win, canvas)
             if cv2.waitKey(1) & 0xFF == ord("q"):
-                return 9999.0
+                return 9999.0, 0.0, 0.0
 
         if collected:
             med = np.median(np.array(collected), axis=0)
-            ex  = (float(med[0]) - pos[0]) * sw
-            ey  = (float(med[1]) - pos[1]) * sh
-            errors.append(float(np.hypot(ex, ey)))
+            ex  = float(med[0]) - pos[0]   # normalizado [0,1]
+            ey  = float(med[1]) - pos[1]
+            err_vx.append(ex)
+            err_vy.append(ey)
+            errors.append(float(np.hypot(ex * sw, ey * sh)))
 
-    avg    = float(np.mean(errors)) if errors else 9999.0
+    avg = float(np.mean(errors)) if errors else 9999.0
+
+    # Detecção de erro sistemático: mediana do vetor de erro
+    sys_dx = float(np.median(err_vx)) if err_vx else 0.0
+    sys_dy = float(np.median(err_vy)) if err_vy else 0.0
+
+    # Direção do desvio para exibição
+    direction_lines: List[str] = []
+    if abs(sys_dy) > 0.05:
+        direction_lines.append("cursor desviando para " + ("CIMA" if sys_dy < 0 else "BAIXO"))
+    if abs(sys_dx) > 0.05:
+        direction_lines.append("cursor desviando para " + ("ESQUERDA" if sys_dx < 0 else "DIREITA"))
+    systematic = bool(direction_lines)
+
     canvas = np.zeros((sh, sw, 3), np.uint8)
-    _text_center(canvas, "Resultado da Validação", sh // 2 - 100, 1.1, (0, 200, 255), 2)
+    _text_center(canvas, "Resultado da Validação", sh // 2 - 120, 1.1, (0, 200, 255), 2)
     for j, err in enumerate(errors):
         col = (0, 220, 80) if err < 80 else ((0, 140, 255) if err < 150 else (0, 60, 220))
         _text_center(canvas, f"Ponto {j + 1}: {err:.0f} px",
-                     sh // 2 - 10 + j * 50, 0.9, col, 2)
+                     sh // 2 - 30 + j * 48, 0.9, col, 2)
     avg_c = (0, 220, 80) if avg < 80 else ((0, 140, 255) if avg < 150 else (0, 60, 220))
-    _text_center(canvas, f"Erro médio: {avg:.0f} px", sh // 2 + 160, 1.0, avg_c, 2)
+    _text_center(canvas, f"Erro médio: {avg:.0f} px", sh // 2 + 120, 1.0, avg_c, 2)
+
+    if systematic:
+        for k, line in enumerate(direction_lines):
+            _text_center(canvas, line, sh // 2 + 168 + k * 32, 0.72, (0, 170, 255), 1)
+        _text_center(canvas, "[ A ] aplicar correção automática",
+                     sh // 2 + 240, 0.72, (0, 220, 130), 1)
+
     _text_center(canvas, "[ SPACE ] continuar   [ R ] recalibrar",
-                 sh // 2 + 220, 0.80, (100, 220, 100), 1)
+                 sh // 2 + 280, 0.75, (100, 220, 100), 1)
     cv2.imshow(win, canvas)
+
     while True:
         key = cv2.waitKey(50) & 0xFF
         if key == ord(" "):
-            return avg
+            return avg, 0.0, 0.0
         if key == ord("r"):
-            return 9999.0
+            return 9999.0, 0.0, 0.0
+        if key == ord("a") and systematic:
+            logger.info("Correção automática aplicada: dx={:.3f} dy={:.3f}", sys_dx, sys_dy)
+            return avg, sys_dx, sys_dy
         if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
-            return avg
+            return avg, 0.0, 0.0
+
+
+# ── Correção geométrica ────────────────────────────────────────────────────────
+
+def _apply_geometric_correction(
+    positions: List[Tuple[float, float]],
+    profile: "GazeProfile",
+) -> List[Tuple[float, float]]:
+    """
+    Corrige posições de calibração pela geometria física do setup.
+    Aplica offset de câmera e escala vertical para monitores grandes.
+    """
+    v_off = profile.vertical_offset
+    if profile.camera_position == "top":
+        v_off += 0.08
+    elif profile.camera_position == "bottom":
+        v_off -= 0.06
+
+    h_off = profile.horizontal_offset
+
+    v_scale = 1.0
+    if profile.monitor_inches >= 23.0:
+        v_scale = 1.0 + 0.15 * (profile.monitor_inches - 15.6) / 10.0
+
+    corrected = []
+    for px, py in positions:
+        new_y = py * v_scale + v_off
+        new_x = px + h_off
+        corrected.append((
+            float(np.clip(new_x, 0.0, 1.0)),
+            float(np.clip(new_y, 0.0, 1.0)),
+        ))
+    return corrected
 
 
 # ── CalibrationSession ────────────────────────────────────────────────────────
@@ -824,6 +896,104 @@ class CalibrationSession:
 
     def _alive(self) -> bool:
         return cv2.getWindowProperty(self.WIN, cv2.WND_PROP_VISIBLE) >= 1
+
+    # ── Setup Físico ──────────────────────────────────────────────────────────
+
+    def _physical_setup_screen(self, profile: "GazeProfile") -> "GazeProfile":
+        """
+        Tela de configuração do setup físico (monitor/câmera/distância).
+        Navegada por teclado: [1–4] monitor, [5–7] câmera, [8–0] distância, [ENTER] confirmar.
+        Exibida sempre que setup_configured=False; nas seguintes mostra valores salvos.
+        """
+        _MONITORS  = [("15\"–17\"", 16.0), ("19\"–22\"", 20.0),
+                      ("23\"–27\"", 24.0), ("28\"+",      30.0)]
+        _CAMERAS   = [("Em cima",   "top"), ("Embaixo", "bottom"), ("Lateral", "side")]
+        _DISTANCES = [("Perto ~40cm", 40.0), ("Normal ~60cm", 60.0), ("Longe ~80cm+", 85.0)]
+
+        mon_idx  = next((i for i, (_, v) in enumerate(_MONITORS)  if v == profile.monitor_inches), 0)
+        cam_idx  = next((i for i, (_, v) in enumerate(_CAMERAS)   if v == profile.camera_position), 0)
+        dist_idx = next((i for i, (_, v) in enumerate(_DISTANCES) if v == profile.distance_cm), 1)
+
+        sw, sh = self._sw, self._sh
+        win    = self.WIN
+
+        while True:
+            canvas = np.zeros((sh, sw, 3), np.uint8)
+            _text_center(canvas, "IrisFlow — Setup Físico", 50, 1.1, (0, 200, 255), 2)
+
+            def _row(label, options, sel, y0, key_offset):
+                cv2.putText(canvas, label, (sw // 2 - 380, y0),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.70, (150, 150, 150), 1)
+                bw = 160
+                gap = 14
+                total_w = len(options) * bw + (len(options) - 1) * gap
+                bx = (sw - total_w) // 2
+                for i, (txt, _) in enumerate(options):
+                    x0b = bx + i * (bw + gap)
+                    bg  = (0, 80, 30) if i == sel else (45, 45, 45)
+                    bd  = (0, 220, 80) if i == sel else (80, 80, 80)
+                    cv2.rectangle(canvas, (x0b, y0 - 28), (x0b + bw, y0 + 12), bg, -1)
+                    cv2.rectangle(canvas, (x0b, y0 - 28), (x0b + bw, y0 + 12), bd, 2)
+                    num = str(key_offset + i + 1) if key_offset + i < 9 else "0"
+                    cv2.putText(canvas, f"[{num}] {txt}",
+                                (x0b + 8, y0 + 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.56,
+                                (0, 255, 100) if i == sel else (200, 200, 200), 1)
+
+            _row("Monitor",  _MONITORS,  mon_idx,  sh // 2 - 100, 0)
+            _row("Câmera",   _CAMERAS,   cam_idx,  sh // 2,       4)
+            _row("Distância", _DISTANCES, dist_idx, sh // 2 + 100, 7)
+
+            _text_center(canvas, "[ ENTER ] confirmar e continuar",
+                         sh // 2 + 190, 0.85, (100, 220, 100), 2)
+            if profile.setup_configured:
+                _text_center(canvas, "Setup salvo anteriormente — altere se necessário",
+                             sh // 2 - 160, 0.70, (120, 120, 120), 1)
+            cv2.imshow(win, canvas)
+
+            key = cv2.waitKey(50) & 0xFF
+            if key == ord("1"):   mon_idx  = 0
+            elif key == ord("2"): mon_idx  = 1
+            elif key == ord("3"): mon_idx  = 2
+            elif key == ord("4"): mon_idx  = 3
+            elif key == ord("5"): cam_idx  = 0
+            elif key == ord("6"): cam_idx  = 1
+            elif key == ord("7"): cam_idx  = 2
+            elif key == ord("8"): dist_idx = 0
+            elif key == ord("9"): dist_idx = 1
+            elif key == ord("0"): dist_idx = 2
+            elif key == 13:  # ENTER
+                profile.monitor_inches   = _MONITORS[mon_idx][1]
+                profile.camera_position  = _CAMERAS[cam_idx][1]
+                profile.distance_cm      = _DISTANCES[dist_idx][1]
+                profile.setup_configured = True
+                profile.save()
+                logger.info(
+                    "Setup físico: {}\" câmera={} dist={}cm",
+                    profile.monitor_inches, profile.camera_position, profile.distance_cm,
+                )
+                return profile
+            elif key == ord("q") or not self._alive():
+                return profile
+
+    # ── Auto-recalibração silenciosa ──────────────────────────────────────────
+
+    def _silent_recalibrate(self, feat: np.ndarray, cx: int, cy: int) -> None:
+        """Adiciona uma amostra pseudo-rotulada e re-ajusta o modelo sem interromper."""
+        if not hasattr(self, "_calib_all_feats"):
+            return
+        try:
+            new_pos = (cx / max(self._sw, 1), cy / max(self._sh, 1))
+            new_feats   = self._calib_all_feats   + [feat]
+            new_pos_all = self._calib_all_pos     + [new_pos]
+            new_weights = self._calib_all_weights + [0.3]
+            self.model.fit(new_feats, new_pos_all, new_weights)
+            self._calib_all_feats   = new_feats
+            self._calib_all_pos     = new_pos_all
+            self._calib_all_weights = new_weights
+            logger.debug("Auto-recal silenciosa: {} pontos totais.", len(new_feats))
+        except Exception as e:
+            logger.debug("Auto-recal silenciosa falhou: {}", e)
 
     # ── Tela de Setup ─────────────────────────────────────────────────────────
 
@@ -918,11 +1088,13 @@ class CalibrationSession:
         )
         self.model.reset_smoothing()
 
-        TH_W, TH_H     = 200, 150
-        DRAW_DT         = 1.0 / 60     # alvo 60fps de renderização
-        last_draw       = 0.0
-        last_annotated  = None
-        cx, cy          = self._sw // 2, self._sh // 2
+        TH_W, TH_H          = 200, 150
+        DRAW_DT              = 1.0 / 60
+        AUTO_RECAL_INTERVAL  = 300
+        last_draw            = 0.0
+        last_annotated       = None
+        cx, cy               = self._sw // 2, self._sh // 2
+        frame_count          = 0
 
         logger.info("Rastreamento ativo.  R=recalibrar  Q=sair")
 
@@ -933,6 +1105,9 @@ class CalibrationSession:
                 if iris_frame is not None:
                     feat   = profile.normalize(iris_frame.gaze_feature)
                     cx, cy = self.model.update(feat, self._sw, self._sh)
+                    frame_count += 1
+                    if frame_count % AUTO_RECAL_INTERVAL == 0:
+                        self._silent_recalibrate(feat, cx, cy)
 
             keyboard.update(cx, cy)
 
@@ -967,7 +1142,7 @@ class CalibrationSession:
     # ── Fluxo Principal ───────────────────────────────────────────────────────
 
     def run(self) -> None:
-        """Setup → Fase 0 → Fase 1 → Fase 2 → modelo → validação → teclado."""
+        """Setup físico → Setup câmera → Fase 0 → Fase 1 → Fase 2 → modelo → validação → teclado."""
         if not self.tracker.open_camera():
             return
         try:
@@ -977,11 +1152,23 @@ class CalibrationSession:
             if not self._setup_screen():
                 return
 
+            # ── Setup físico (uma vez por sessão) ─────────────────────────────
+            saved_profile = GazeProfile.load()
+            _base_profile = saved_profile if saved_profile is not None else GazeProfile()
+            _base_profile = self._physical_setup_screen(_base_profile)
+
             while True:
                 # ── Fase 0 ────────────────────────────────────────────────────
                 profile = _run_phase0(self.tracker, self._sw, self._sh, self.WIN)
 
-                # Aplica configurações do perfil ao tracker
+                # Preserva configurações de setup físico do perfil base
+                profile.monitor_inches    = _base_profile.monitor_inches
+                profile.camera_position   = _base_profile.camera_position
+                profile.distance_cm       = _base_profile.distance_cm
+                profile.vertical_offset   = _base_profile.vertical_offset
+                profile.horizontal_offset = _base_profile.horizontal_offset
+                profile.setup_configured  = _base_profile.setup_configured
+
                 self.tracker.set_dominant_eye(profile.dominant)
                 self.tracker.set_glasses_mode(profile.has_glasses)
 
@@ -995,23 +1182,23 @@ class CalibrationSession:
 
                 weights = [1.0] * len(feats1)
 
-                # ── Fase 2 intro ──────────────────────────────────────────────
+                # ── Fase 2 intro (pulada por padrão) ─────────────────────────
                 canvas = np.zeros((self._sh, self._sw, 3), np.uint8)
-                _text_center(canvas, "Fase 2 — Trajetórias",
+                _text_center(canvas, "Fase 2 — Trajetórias (opcional)",
                              self._sh // 2 - 70, 1.2, (0, 200, 255), 2)
-                _text_center(canvas, "Um alvo se moverá — siga com os olhos.",
+                _text_center(canvas, "Melhora a precisão nas bordas da tela.",
                              self._sh // 2,      0.80, (200, 200, 200), 1)
-                _text_center(canvas, "[ SPACE ] iniciar   [ Q ] pular fase 2",
+                _text_center(canvas, "[ T ] ativar trajetórias   [ SPACE ] pular",
                              self._sh // 2 + 70, 0.80, (100, 220, 100), 1)
                 cv2.imshow(self.WIN, canvas)
 
                 do_phase2 = False
                 while True:
                     key = cv2.waitKey(50) & 0xFF
-                    if key == ord(" "):
+                    if key == ord("t"):
                         do_phase2 = True
                         break
-                    if key == ord("q") or not self._alive():
+                    if key == ord(" ") or key == ord("q") or not self._alive():
                         break
 
                 feats2, pos2 = [], []
@@ -1032,7 +1219,7 @@ class CalibrationSession:
                 )
                 logger.info("Histórico: {} pontos de sessões anteriores.", len(hist_feats))
 
-                # 2. Prior MPIIGaze (prior_gaze.npy gerado pelo scripts/build_prior.py)
+                # 2. Prior MPIIGaze com filtragem por setup físico
                 prior_feats:   list = []
                 prior_pos:     list = []
                 prior_weights: list = []
@@ -1051,6 +1238,13 @@ class CalibrationSession:
                         p_gy_range = max(float(prior_data["gy_max"]) - float(prior_data["gy_min"]), 1e-5)
 
                         for feat, pos in zip(p_feats, p_poses):
+                            pos_y = float(pos[1])
+                            # Monitor grande + câmera em cima: usar só região central-inferior
+                            if (profile.monitor_inches >= 23.0
+                                    and profile.camera_position == "top"
+                                    and pos_y <= 0.3):
+                                continue
+
                             nx = (feat[0] - float(prior_data["gx_min"])) / p_gx_range
                             ny = (feat[1] - float(prior_data["gy_min"])) / p_gy_range
 
@@ -1072,10 +1266,15 @@ class CalibrationSession:
                     logger.info("prior_gaze.npy não encontrado — rodando sem prior. "
                                 "Execute scripts/build_prior.py para gerar.")
 
-                # 3. Combina: sessão atual + histórico + prior
+                # 3. Aplica correção geométrica nas posições da sessão atual
+                pos1_corr  = _apply_geometric_correction(pos1,  profile)
+                pos2_corr  = _apply_geometric_correction(pos2,  profile)
+                hist_pos_c = _apply_geometric_correction(hist_pos, profile)
+
+                # 4. Combina: sessão corrigida + histórico corrigido + prior
                 all_feats   = feats1 + feats2 + hist_feats   + prior_feats
-                all_pos     = pos1   + pos2   + hist_pos     + prior_pos
-                all_weights = weights         + hist_weights + prior_weights
+                all_pos     = pos1_corr + pos2_corr + hist_pos_c + prior_pos
+                all_weights = weights           + hist_weights + prior_weights
 
                 logger.info(
                     "model.fit(): {} pts sessão + {} histórico + {} prior = {} total",
@@ -1090,10 +1289,31 @@ class CalibrationSession:
                     return
                 self.model.reset_smoothing()
 
+                # Armazena dados da calibração para auto-recalibração silenciosa
+                self._calib_all_feats   = list(all_feats)
+                self._calib_all_pos     = list(all_pos)
+                self._calib_all_weights = list(all_weights)
+
                 # ── Validação ─────────────────────────────────────────────────
-                avg_err = _run_validation(
+                avg_err, sys_dx, sys_dy = _run_validation(
                     self.tracker, profile, self.model,
                     self._sw, self._sh, self.WIN)
+
+                # Aplica correção automática de offset sistemático se solicitado
+                if abs(sys_dx) > 0.01 or abs(sys_dy) > 0.01:
+                    profile.horizontal_offset -= sys_dx
+                    profile.vertical_offset   -= sys_dy
+                    _base_profile.horizontal_offset = profile.horizontal_offset
+                    _base_profile.vertical_offset   = profile.vertical_offset
+                    pos1_corr  = _apply_geometric_correction(pos1,  profile)
+                    pos2_corr  = _apply_geometric_correction(pos2,  profile)
+                    hist_pos_c = _apply_geometric_correction(hist_pos, profile)
+                    all_pos    = pos1_corr + pos2_corr + hist_pos_c + prior_pos
+                    self.model.fit(all_feats, all_pos, all_weights)
+                    self.model.reset_smoothing()
+                    self._calib_all_pos = list(all_pos)
+                    logger.info("Offset corrigido: dx={:.3f} dy={:.3f}",
+                                profile.horizontal_offset, profile.vertical_offset)
 
                 if avg_err > 80:
                     canvas = np.zeros((self._sh, self._sw, 3), np.uint8)
@@ -1107,7 +1327,6 @@ class CalibrationSession:
 
                 # ── Salvar sessão no histórico ────────────────────────────────
                 try:
-                    from calib_store import save_session
                     save_session(
                         profile  = profile,
                         feats1   = feats1,
