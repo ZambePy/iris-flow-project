@@ -5,7 +5,7 @@ Camada 4  Calibração:
   Fase 0 — Assinatura ocular (varredura H+V, aprende range, detecta óculos/dominante)
   Fase 1 — 9 pontos centrais (grade 3×3, zona 65% da tela)
   Fase 2 — Trajetórias (cruz, espiral, figura-8, borda circular)
-  Modelo — RBFInterpolator thin-plate-spline (scipy)
+  Modelo — Transformação afim (A 2×2 + b) ajustada por mínimos quadrados ponderados
 
 Camada 5  Saída suave:
   Filtro de Kalman 2D (filterpy) + EMA deadzone adaptativa + LERP 0.08
@@ -25,12 +25,6 @@ import cv2
 import numpy as np
 from loguru import logger
 
-try:
-    from scipy.interpolate import RBFInterpolator
-    _HAS_SCIPY = True
-except ImportError:
-    _HAS_SCIPY = False
-    logger.warning("scipy não encontrado — pip install scipy")
 
 try:
     from filterpy.kalman import KalmanFilter as _FPKalman
@@ -238,28 +232,25 @@ class AdaptiveDeadzone:
 
 class GazeModel:
     """
-    Mapeia feature normalizada → posição na tela.
+    Mapeia saída da CNN ([x, y] em [0,1]) → posição corrigida na tela.
 
-    Modelo: RBFInterpolator (thin-plate spline) sobre gaze features normalizadas.
+    Modelo: transformação afim ponderada (A 2×2 + b 2) ajustada via mínimos quadrados
+    sobre os pontos de calibração. Mais estável que RBF com poucos pontos.
     Pós-processamento: Kalman 2D → deadzone adaptativa → LERP 0.08.
     """
 
-    LERP         = 0.08
-    TRAJ_SMOOTH  = 0.05
-    FIXED_SMOOTH = 1e-3
+    LERP = 0.08
 
     def __init__(self) -> None:
-        self._rbf_x   = None
-        self._rbf_y   = None
-        self._fitted  = False
-        self._fmean   = np.zeros(2)
-        self._fstd    = np.ones(2)
-        self._kalman  = KalmanFilter2D()
-        self._dz      = AdaptiveDeadzone()
-        self._cx      = -1.0    # -1 = não inicializado; definido na 1ª chamada de update()
-        self._cy      = -1.0
-        self._hx      = -1.0
-        self._hy      = -1.0
+        self._A_mat  = np.eye(2, dtype=float)     # mapeamento afim (inicialmente identidade)
+        self._b_vec  = np.zeros(2, dtype=float)   # offset afim
+        self._fitted = False
+        self._kalman = KalmanFilter2D()
+        self._dz     = AdaptiveDeadzone()
+        self._cx     = -1.0   # -1 = não inicializado; definido na 1ª chamada de update()
+        self._cy     = -1.0
+        self._hx     = -1.0
+        self._hy     = -1.0
 
     @property
     def is_fitted(self) -> bool:
@@ -271,57 +262,47 @@ class GazeModel:
         positions: List[Tuple[float, float]],
         weights:   Optional[List[float]] = None,
     ) -> bool:
-        if not _HAS_SCIPY:
-            logger.error("scipy necessário — pip install scipy")
-            return False
+        """
+        Ajusta transformação afim ponderada: tela ≈ A @ cnn_output + b.
+        features e positions devem estar normalizados em [0, 1].
+        """
         n = len(features)
         if n < 4:
             logger.error("Mínimo 4 pontos para calibração (recebido {}).", n)
             return False
 
-        X = np.array(features,  dtype=float)
-        Y = np.array(positions, dtype=float)
+        X = np.array(features,  dtype=float)   # (n, 2)
+        Y = np.array(positions, dtype=float)   # (n, 2)
         w = np.asarray(weights, dtype=float) if weights else np.ones(n)
 
-        # Z-score das features
-        self._fmean = X.mean(axis=0)
-        self._fstd  = np.maximum(X.std(axis=0), 1e-6)
-        Xn = (X - self._fmean) / self._fstd
+        # Matriz de design: [feat_x, feat_y, 1]
+        A = np.column_stack([X, np.ones(n)])   # (n, 3)
 
-        # Remove outliers de trajetória (resíduo > 2.5× mediana)
-        traj_mask = w < 1.0
-        if traj_mask.sum() >= 20:
-            A  = np.column_stack([Xn, np.ones(n)])
-            cx, *_ = np.linalg.lstsq(A * w[:, None], Y[:, 0] * w, rcond=None)
-            cy, *_ = np.linalg.lstsq(A * w[:, None], Y[:, 1] * w, rcond=None)
-            res = np.hypot(Y[:, 0] - A @ cx, Y[:, 1] - A @ cy)
-            med = float(np.median(res[traj_mask]))
-            bad = traj_mask & (res > 2.5 * max(med, 1e-6))
-            if bad.sum():
-                logger.info("Outliers removidos: {}/{}", int(bad.sum()), int(traj_mask.sum()))
-            Xn, Y, w = Xn[~bad], Y[~bad], w[~bad]
+        # Mínimos quadrados ponderados: escalar linhas por sqrt(w)
+        w_sqrt = np.sqrt(np.clip(w, 0.0, None))
+        Aw  = A  * w_sqrt[:, None]
+        Yw  = Y  * w_sqrt[:, None]
 
-        smooth = np.where(w >= 1.0, self.FIXED_SMOOTH, self.TRAJ_SMOOTH)
+        theta_x, *_ = np.linalg.lstsq(Aw, Yw[:, 0], rcond=None)
+        theta_y, *_ = np.linalg.lstsq(Aw, Yw[:, 1], rcond=None)
 
-        try:
-            self._rbf_x = RBFInterpolator(
-                Xn, Y[:, 0], kernel="thin_plate_spline", smoothing=smooth, degree=1)
-            self._rbf_y = RBFInterpolator(
-                Xn, Y[:, 1], kernel="thin_plate_spline", smoothing=smooth, degree=1)
-            self._fitted = True
-            logger.info("GazeModel ajustado com {} pontos.", len(Xn))
-            return True
-        except Exception as e:
-            logger.error("Falha no RBF: {}", e)
-            return False
+        self._A_mat = np.array([
+            [theta_x[0], theta_x[1]],
+            [theta_y[0], theta_y[1]],
+        ], dtype=float)
+        self._b_vec  = np.array([theta_x[2], theta_y[2]], dtype=float)
+        self._fitted = True
+        logger.info("GazeModel (afim) ajustado com {} pontos.", n)
+        return True
 
     def predict_raw(self, feat: np.ndarray) -> Optional[Tuple[float, float]]:
         if not self._fitted:
             return None
-        fn = ((feat - self._fmean) / self._fstd).reshape(1, -1)
-        x  = float(np.clip(self._rbf_x(fn)[0], -0.1, 1.1))
-        y  = float(np.clip(self._rbf_y(fn)[0], -0.1, 1.1))
-        return x, y
+        xy = self._A_mat @ feat + self._b_vec
+        return (
+            float(np.clip(xy[0], -0.1, 1.1)),
+            float(np.clip(xy[1], -0.1, 1.1)),
+        )
 
     def update(self, feat: np.ndarray, sw: int, sh: int) -> Tuple[int, int]:
         """
@@ -379,116 +360,130 @@ def _run_phase0(
     win: str,
 ) -> GazeProfile:
     """
-    Varredura H (5s) + V (5s): aprende range de gaze, detecta óculos e olho dominante.
+    Fase 0: 4 cantos da tela (~2s cada). Calcula range inicial de gaze a partir
+    de posições fixas e conhecidas. Detecta óculos e olho dominante.
+    Os frames coletados NÃO entram no model.fit() — apenas determinam o range.
     """
 
-    SWEEP_FRAMES = 90       # ~3s @ 30fps
-    MARGIN       = 0.05
+    CORNER_MARGIN = 0.06
+    COLLECT_SECS  = 2.5
+
+    CORNERS: List[Tuple[float, float, str]] = [
+        (CORNER_MARGIN,         CORNER_MARGIN,         "Canto superior esquerdo"),
+        (1.0 - CORNER_MARGIN,   CORNER_MARGIN,         "Canto superior direito"),
+        (CORNER_MARGIN,         1.0 - CORNER_MARGIN,   "Canto inferior esquerdo"),
+        (1.0 - CORNER_MARGIN,   1.0 - CORNER_MARGIN,   "Canto inferior direito"),
+    ]
 
     for ct in range(3, 0, -1):
         canvas = np.zeros((sh, sw, 3), np.uint8)
         _text_center(canvas, f"Fase 0 — Assinatura ocular em {ct}...",
                      sh // 2 - 30, 1.2, (0, 200, 255), 2)
-        _text_center(canvas, "Siga o ponto com os olhos",
+        _text_center(canvas, "Olhe FIXAMENTE para cada canto da tela",
                      sh // 2 + 40, 0.85, (150, 150, 150), 1)
         cv2.imshow(win, canvas)
         cv2.waitKey(1000)
 
-    def _collect_sweep(h_sweep: bool):
-        targets, features, l_gazes, r_gazes = [], [], [], []
-        last_annotated = None
-        fi = 0
+    corner_medians: List[np.ndarray] = []
+    all_feats_raw:  List[np.ndarray] = []
+    all_l_gazes:    List[np.ndarray] = []
+    all_r_gazes:    List[np.ndarray] = []
+    all_targets_x:  List[float]      = []
+    last_annotated = None
 
-        while fi < SWEEP_FRAMES:
+    for c_idx, (tx, ty, label) in enumerate(CORNERS):
+        corner_samples: List[np.ndarray] = []
+        corner_l:       List[np.ndarray] = []
+        corner_r:       List[np.ndarray] = []
+        t_end = time.time() + COLLECT_SECS
+
+        while time.time() < t_end:
             frame = tracker.read_frame(timeout=0.010)
-
-            t   = fi / max(SWEEP_FRAMES - 1, 1)
-            pos = MARGIN + t * (1.0 - 2.0 * MARGIN)
-            tx, ty = (pos, 0.5) if h_sweep else (0.5, pos)
-
             if frame is not None:
                 iris_frame, last_annotated = tracker.process_frame(frame, draw=True)
                 if iris_frame is not None:
-                    targets.append((tx, ty))
-                    features.append(iris_frame.gaze_feature.copy())
-                    l_gazes.append(iris_frame.left_gaze[:2].copy())
-                    r_gazes.append(iris_frame.right_gaze[:2].copy())
-                fi += 1
+                    corner_samples.append(iris_frame.gaze_feature.copy())
+                    corner_l.append(iris_frame.left_gaze[:2].copy())
+                    corner_r.append(iris_frame.right_gaze[:2].copy())
 
-            canvas = np.zeros((sh, sw, 3), np.uint8)
-            px, py = int(tx * sw), int(ty * sh)
-            pulse  = 0.5 + 0.5 * np.sin(time.time() * 6)
+            progress = 1.0 - max((t_end - time.time()) / COLLECT_SECS, 0.0)
+            canvas   = np.zeros((sh, sw, 3), np.uint8)
+            px, py   = int(tx * sw), int(ty * sh)
+            pulse    = 0.5 + 0.5 * np.sin(time.time() * 6)
             cv2.circle(canvas, (px, py), int(18 + 6 * pulse), (0, 200, 255), 3)
             cv2.circle(canvas, (px, py), 10, (255, 255, 255), -1)
-            label  = "Fase 0: horizontal — siga o ponto" if h_sweep else "Fase 0: vertical — siga o ponto"
-            _text_center(canvas, label, 50, 0.85, (180, 180, 180), 1)
+            _text_center(canvas, f"Fase 0 ({c_idx + 1}/4): {label}", 50, 0.85, (180, 180, 180), 1)
             bw, bx = 500, (sw - 500) // 2
-            _progress_bar(canvas, bx, sh - 60, bw, 12, fi / SWEEP_FRAMES)
+            _progress_bar(canvas, bx, sh - 60, bw, 12, progress)
             if last_annotated is not None:
                 _thumb(canvas, last_annotated)
             cv2.imshow(win, canvas)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
+            if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
-        return targets, features, l_gazes, r_gazes
+        if corner_samples:
+            arr = np.array(corner_samples)
+            # Filtrar outliers: descartar amostras com norma > 2σ da mediana temporária
+            norms   = np.linalg.norm(arr, axis=1)
+            med_n   = float(np.median(norms))
+            std_n   = float(np.std(norms))
+            mask    = np.abs(norms - med_n) <= 2.0 * max(std_n, 1e-6)
+            clean   = arr[mask]
+            if len(clean) < 5:
+                clean = arr[-min(10, len(arr)):]   # fallback: últimas 10 sem filtro
+            med = np.median(clean, axis=0)
+            corner_medians.append(med)
+            for s in clean:
+                all_feats_raw.append(s)
+            all_l_gazes.extend([corner_l[i] for i in range(len(corner_l)) if mask[i]])
+            all_r_gazes.extend([corner_r[i] for i in range(len(corner_r)) if mask[i]])
+            all_targets_x.extend([tx] * int(mask.sum()))
 
-    # ── Sweep H ───────────────────────────────────────────────────────────────
-    tgts_h, feats_h, l_h, r_h = _collect_sweep(h_sweep=True)
+        if c_idx < len(CORNERS) - 1:
+            cv2.waitKey(300)
 
-    for _ in range(45):
-        canvas = np.zeros((sh, sw, 3), np.uint8)
-        _text_center(canvas, "Agora vertical...", sh // 2, 1.1, (0, 200, 255), 2)
-        cv2.imshow(win, canvas)
-        cv2.waitKey(33)
+    # ── Range a partir das medianas dos cantos ────────────────────────────────
+    if len(corner_medians) >= 2:
+        gx_vals = [float(m[0]) for m in corner_medians]
+        gy_vals = [float(m[1]) for m in corner_medians]
 
-    # ── Sweep V ───────────────────────────────────────────────────────────────
-    tgts_v, feats_v, l_v, r_v = _collect_sweep(h_sweep=False)
+        gx_min_raw, gx_max_raw = min(gx_vals), max(gx_vals)
+        gy_min_raw, gy_max_raw = min(gy_vals), max(gy_vals)
 
-    # ── Range por percentil (robusto a usuários que rastreiam com a cabeça) ──────
-    # Usa TODOS os frames de ambas as varreduras: H sweep cobre bem gx,
-    # V sweep cobre bem gy, mas cruzar os dados garante um piso mínimo razoável.
+        margin_x = 0.20 * max(gx_max_raw - gx_min_raw, 0.04)
+        margin_y = 0.20 * max(gy_max_raw - gy_min_raw, 0.04)
 
-    def _percentile_range(vals, min_range: float = 0.05):
-        if len(vals) < 10:
-            return -min_range / 2, min_range / 2, 0.001
-        v   = np.array(vals, dtype=float)
-        p2  = float(np.percentile(v, 2))
-        p98 = float(np.percentile(v, 98))
-        actual = p98 - p2
-        # Garante range mínimo centrado na mediana
-        if actual < min_range:
-            mid = float(np.median(v))
-            p2  = mid - min_range / 2
-            p98 = mid + min_range / 2
-            actual = min_range
-        margin = 0.10 * actual     # 10% de margem extra em cada lado
-        return p2 - margin, p98 + margin, float(np.var(v))
+        gx_min = gx_min_raw - margin_x
+        gx_max = gx_max_raw + margin_x
+        gy_min = gy_min_raw - margin_y
+        gy_max = gy_max_raw + margin_y
+    else:
+        gx_min, gx_max = -0.25,  0.25
+        gy_min, gy_max = -0.20,  0.20
 
-    all_feats = feats_h + feats_v
-    gx_vals   = [f[0] for f in all_feats]
-    gy_vals   = [f[1] for f in all_feats]
-
-    gx_min, gx_max, gx_var = _percentile_range(gx_vals, min_range=0.06)
-    gy_min, gy_max, gy_var = _percentile_range(gy_vals, min_range=0.06)
-
-    # ── Detecção de olho dominante (maior correlação com target) ──────────────
+    # ── Detecção de olho dominante (correlação com posição horizontal) ────────
     dominant = "left"
-    n_h = min(len(tgts_h), len(l_h), len(r_h))
-    if n_h >= 10:
-        t_arr = np.array([v[0] for v in tgts_h[:n_h]])
-        lx    = np.array([v[0] for v in l_h[:n_h]])
-        rx    = np.array([v[0] for v in r_h[:n_h]])
+    n = min(len(all_targets_x), len(all_l_gazes), len(all_r_gazes))
+    if n >= 8:
+        t_arr = np.array(all_targets_x[:n])
+        lx    = np.array([v[0] for v in all_l_gazes[:n]])
+        rx    = np.array([v[0] for v in all_r_gazes[:n]])
         cl    = abs(float(np.corrcoef(t_arr, lx)[0, 1])) if np.std(lx) > 1e-8 else 0.0
         cr    = abs(float(np.corrcoef(t_arr, rx)[0, 1])) if np.std(rx) > 1e-8 else 0.0
         dominant = "left" if cl >= cr else "right"
 
     # ── Detecção de óculos (variância relativa alta) ──────────────────────────
-    avg_var     = (gx_var + gy_var) / 2
-    gx_range    = max(gx_max - gx_min, 1e-5)
-    gy_range    = max(gy_max - gy_min, 1e-5)
-    rel_var     = (gx_var / gx_range ** 2 + gy_var / gy_range ** 2) / 2
-    has_glasses = rel_var > 0.06
+    avg_var     = 0.001
+    has_glasses = False
+    if all_feats_raw:
+        feats_arr   = np.array(all_feats_raw)
+        gx_var      = float(np.var(feats_arr[:, 0]))
+        gy_var      = float(np.var(feats_arr[:, 1]))
+        avg_var     = (gx_var + gy_var) / 2
+        gx_range_   = max(gx_max - gx_min, 1e-5)
+        gy_range_   = max(gy_max - gy_min, 1e-5)
+        rel_var     = (gx_var / gx_range_ ** 2 + gy_var / gy_range_ ** 2) / 2
+        has_glasses = rel_var > 0.06
 
     profile = GazeProfile(
         gaze_x_min  = gx_min,
@@ -528,9 +523,13 @@ def _run_phase1(
     sw: int, sh: int,
     win: str,
 ) -> Tuple[List[np.ndarray], List[Tuple[float, float]]]:
-    """Grade 3×3 na zona central (65% da tela). 2s contagem + 1.5s coleta por ponto."""
+    """
+    Grade 3×3 na zona central (65% da tela).
+    Coleta features brutas, recalcula o range do GazeProfile a partir dos 9 pontos,
+    salva o perfil atualizado e retorna features já normalizadas com o range correto.
+    """
 
-    M = 0.175   # margem para zona central: (1-0.65)/2
+    M = 0.175
     POINTS = [
         (M,      M),     (0.5,    M),     (1 - M, M),
         (M,      0.5),   (0.5,    0.5),   (1 - M, 0.5),
@@ -539,9 +538,9 @@ def _run_phase1(
     COUNTDOWN = 1.2
     COLLECT   = 1.0
 
-    feats:    List[np.ndarray]          = []
-    pos_list: List[Tuple[float, float]] = []
-    done:     List[int]                 = []
+    raw_feats: List[np.ndarray]          = []
+    pos_list:  List[Tuple[float, float]] = []
+    done:      List[int]                 = []
 
     def _draw_dots(canvas, active_idx):
         for i, p in enumerate(POINTS):
@@ -554,7 +553,7 @@ def _run_phase1(
                 cv2.circle(canvas, (cx2, cy2), 14, (40, 40, 40),   2)
 
     for idx, pos in enumerate(POINTS):
-        px, py        = int(pos[0] * sw), int(pos[1] * sh)
+        px, py         = int(pos[0] * sw), int(pos[1] * sh)
         last_annotated = None
 
         # ── Contagem regressiva ───────────────────────────────────────────────
@@ -575,17 +574,17 @@ def _run_phase1(
                 _thumb(canvas, last_annotated)
             cv2.imshow(win, canvas)
             if cv2.waitKey(1) & 0xFF == ord("q"):
-                return feats, pos_list
+                return [profile.normalize(f) for f in raw_feats], pos_list
 
-        # ── Coleta ───────────────────────────────────────────────────────────
-        collected: List[np.ndarray] = []
+        # ── Coleta de features brutas ─────────────────────────────────────────
+        collected_raw: List[np.ndarray] = []
         t_end = time.time() + COLLECT
         while time.time() < t_end:
             frame = tracker.read_frame(timeout=0.010)
             if frame is not None:
                 iris_frame, last_annotated = tracker.process_frame(frame, draw=True)
                 if iris_frame is not None:
-                    collected.append(profile.normalize(iris_frame.gaze_feature))
+                    collected_raw.append(iris_frame.gaze_feature.copy())
             canvas = np.zeros((sh, sw, 3), np.uint8)
             _draw_dots(canvas, idx)
             cv2.circle(canvas, (px, py), 12, (255, 255, 255), -1)
@@ -596,13 +595,13 @@ def _run_phase1(
             cv2.imshow(win, canvas)
             cv2.waitKey(1)
 
-        if collected:
-            stacked = np.array(collected)
+        if collected_raw:
+            stacked = np.array(collected_raw)
             median  = np.median(stacked, axis=0)
-            feats.append(median)
+            raw_feats.append(median)
             pos_list.append(pos)
             done.append(idx)
-            logger.info("Ponto {} capturado: feat=({:.4f}, {:.4f})",
+            logger.info("Ponto {} capturado: feat_raw=({:.4f}, {:.4f})",
                         idx + 1, float(median[0]), float(median[1]))
         else:
             logger.warning("Ponto {} sem amostras — pulado.", idx + 1)
@@ -610,6 +609,49 @@ def _run_phase1(
         if idx < len(POINTS) - 1:
             cv2.waitKey(400)
 
+    # ── Recalcular range a partir dos pontos brutos da grade 3×3 ─────────────
+    if len(raw_feats) >= 4:
+        rx_vals = [float(f[0]) for f in raw_feats]
+        ry_vals = [float(f[1]) for f in raw_feats]
+
+        rx_min, rx_max = min(rx_vals), max(rx_vals)
+        ry_min, ry_max = min(ry_vals), max(ry_vals)
+        range_x = rx_max - rx_min
+        range_y = ry_max - ry_min
+
+        margin_x = 0.20 * max(range_x, 1e-5)
+        margin_y = 0.20 * max(range_y, 1e-5)
+
+        new_gx_min = rx_min - margin_x
+        new_gx_max = rx_max + margin_x
+        new_gy_min = ry_min - margin_y
+        new_gy_max = ry_max + margin_y
+
+        if range_y < 0.15:
+            logger.warning(
+                "Fase 1: range Y bruto = {:.4f} < 0.15 — usando fallback 0.25 centrado na mediana.",
+                range_y,
+            )
+            mid_y      = (ry_min + ry_max) / 2.0
+            new_gy_min = mid_y - 0.125
+            new_gy_max = mid_y + 0.125
+
+        # X usa o range bruto + margem diretamente — não há fallback, pois o range
+        # real de ~1.9 é genuíno para este usuário e truncar causa clipping severo.
+        logger.info("Fase 1: range X bruto = {:.4f} (com margem: {:.4f})", range_x, new_gx_max - new_gx_min)
+
+        profile.gaze_x_min = new_gx_min
+        profile.gaze_x_max = new_gx_max
+        profile.gaze_y_min = new_gy_min
+        profile.gaze_y_max = new_gy_max
+        profile.save()
+        logger.info(
+            "Fase 1: range atualizado — gx=[{:.4f}, {:.4f}]  gy=[{:.4f}, {:.4f}]",
+            new_gx_min, new_gx_max, new_gy_min, new_gy_max,
+        )
+
+    # ── Normalizar com range correto e retornar ───────────────────────────────
+    feats = [profile.normalize(f) for f in raw_feats]
     return feats, pos_list
 
 
@@ -840,17 +882,19 @@ def _apply_geometric_correction(
     Corrige posições de calibração pela geometria física do setup.
     Aplica offset de câmera e escala vertical para monitores grandes.
     """
-    v_off = profile.vertical_offset
-    if profile.camera_position == "top":
-        v_off += 0.08
-    elif profile.camera_position == "bottom":
-        v_off -= 0.06
-
-    h_off = profile.horizontal_offset
-
+    h_off   = profile.horizontal_offset
+    v_off   = profile.vertical_offset
     v_scale = 1.0
-    if profile.monitor_inches >= 23.0:
-        v_scale = 1.0 + 0.15 * (profile.monitor_inches - 15.6) / 10.0
+
+    # Offset de câmera e escala vertical só fazem sentido em monitores externos
+    # (notebook já tem câmera alinhada com a tela)
+    if profile.monitor_inches >= 20.0:
+        if profile.camera_position == "top":
+            v_off += 0.08
+        elif profile.camera_position == "bottom":
+            v_off -= 0.06
+        if profile.monitor_inches >= 23.0:
+            v_scale = 1.0 + 0.15 * (profile.monitor_inches - 15.6) / 10.0
 
     corrected = []
     for px, py in positions:
@@ -999,59 +1043,64 @@ class CalibrationSession:
 
     def _setup_screen(self) -> bool:
         last_annotated = None
+        face_ok        = False
+        light_ok       = False
+        last_draw      = 0.0
+
         while True:
             frame = self.tracker.read_frame(timeout=0.010)
-            iris_data = None
             if frame is not None:
                 iris_data, last_annotated = self.tracker.process_frame(frame, draw=True)
+                gray     = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                light    = float(np.mean(gray))
+                face_ok  = iris_data is not None
+                light_ok = 60 <= light <= 200
 
-            gray     = cv2.cvtColor(frame if frame is not None else
-                                    np.zeros((480, 640, 3), np.uint8),
-                                    cv2.COLOR_BGR2GRAY)
-            light    = float(np.mean(gray))
-            face_ok  = iris_data is not None
-            light_ok = 60 <= light <= 200
+            now = time.time()
+            if now - last_draw >= 0.033:
+                last_draw = now
+                pw  = min(int(self._sw * 0.54), 800)
+                ph  = int(pw * 9 / 16)
+                px0 = (self._sw - pw) // 2
+                py0 = 80
 
-            pw  = min(int(self._sw * 0.54), 800)
-            ph  = int(pw * 9 / 16)
-            px0 = (self._sw - pw) // 2
-            py0 = 80
+                canvas = np.zeros((self._sh, self._sw, 3), np.uint8)
+                if last_annotated is not None:
+                    thumb = cv2.resize(cv2.flip(last_annotated, 1), (pw, ph))
+                    canvas[py0:py0 + ph, px0:px0 + pw] = thumb
 
-            canvas = np.zeros((self._sh, self._sw, 3), np.uint8)
-            if last_annotated is not None:
-                thumb = cv2.resize(cv2.flip(last_annotated, 1), (pw, ph))
-                canvas[py0:py0 + ph, px0:px0 + pw] = thumb
+                oval_c = (0, 220, 80) if (face_ok and light_ok) else (80, 80, 80)
+                cv2.ellipse(canvas, (self._sw // 2, py0 + ph // 2),
+                            (int(pw * 0.21), int(ph * 0.42)), 0, 0, 360, oval_c, 3)
 
-            oval_c = (0, 220, 80) if (face_ok and light_ok) else (80, 80, 80)
-            cv2.ellipse(canvas, (self._sw // 2, py0 + ph // 2),
-                        (int(pw * 0.21), int(ph * 0.42)), 0, 0, 360, oval_c, 3)
+                checks = [("Íris detectada", face_ok), ("Iluminação adequada", light_ok)]
+                all_ok = all(ok for _, ok in checks)
+                by     = py0 + ph + 52
+                for i, (lbl, ok) in enumerate(checks):
+                    col = (0, 220, 80) if ok else (60, 80, 220)
+                    cv2.circle(canvas, (self._sw // 2 - 250, by + i * 44 - 6), 9, col, -1)
+                    cv2.putText(canvas, lbl, (self._sw // 2 - 224, by + i * 44),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.70, col, 2)
 
-            checks = [("Íris detectada", face_ok), ("Iluminação adequada", light_ok)]
-            all_ok = all(ok for _, ok in checks)
-            by     = py0 + ph + 52
-            for i, (lbl, ok) in enumerate(checks):
-                col = (0, 220, 80) if ok else (60, 80, 220)
-                cv2.circle(canvas, (self._sw // 2 - 250, by + i * 44 - 6), 9, col, -1)
-                cv2.putText(canvas, lbl, (self._sw // 2 - 224, by + i * 44),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.70, col, 2)
+                btn_y = by + len(checks) * 44 + 30
+                if all_ok:
+                    cv2.rectangle(canvas,
+                                  (self._sw // 2 - 250, btn_y),
+                                  (self._sw // 2 + 250, btn_y + 48), (0, 55, 20), -1)
+                    cv2.rectangle(canvas,
+                                  (self._sw // 2 - 250, btn_y),
+                                  (self._sw // 2 + 250, btn_y + 48), (0, 200, 70), 2)
+                    _text_center(canvas, "[ ENTER ] Iniciar calibração",
+                                 btn_y + 33, 0.90, (0, 255, 100), 2)
+                else:
+                    _text_center(canvas, "Ajuste o setup acima", btn_y + 26, 0.80, (100, 100, 100), 1)
 
-            btn_y = by + len(checks) * 44 + 30
-            if all_ok:
-                cv2.rectangle(canvas,
-                              (self._sw // 2 - 250, btn_y),
-                              (self._sw // 2 + 250, btn_y + 48), (0, 55, 20), -1)
-                cv2.rectangle(canvas,
-                              (self._sw // 2 - 250, btn_y),
-                              (self._sw // 2 + 250, btn_y + 48), (0, 200, 70), 2)
-                _text_center(canvas, "[ ENTER ] Iniciar calibração",
-                             btn_y + 33, 0.90, (0, 255, 100), 2)
+                _text_center(canvas, "IrisFlow — Setup", 44, 1.0, (0, 200, 255), 2)
+                _text_center(canvas, "[ SPACE ] pular calibração   [ Q ] sair",
+                             self._sh - 18, 0.52, (60, 60, 60), 1)
+                cv2.imshow(self.WIN, canvas)
             else:
-                _text_center(canvas, "Ajuste o setup acima", btn_y + 26, 0.80, (100, 100, 100), 1)
-
-            _text_center(canvas, "IrisFlow — Setup", 44, 1.0, (0, 200, 255), 2)
-            _text_center(canvas, "[ SPACE ] pular calibração   [ Q ] sair",
-                         self._sh - 18, 0.52, (60, 60, 60), 1)
-            cv2.imshow(self.WIN, canvas)
+                all_ok = face_ok and light_ok
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q") or not self._alive():
@@ -1143,6 +1192,20 @@ class CalibrationSession:
 
     def run(self) -> None:
         """Setup físico → Setup câmera → Fase 0 → Fase 1 → Fase 2 → modelo → validação → teclado."""
+        # ── Limpar sessões ruins do histórico ─────────────────────────────────
+        try:
+            from calib_store import _connect
+            conn    = _connect()
+            deleted = conn.execute(
+                "DELETE FROM sessions WHERE error_px > 500 OR error_px = 9999"
+            ).rowcount
+            conn.commit()
+            conn.close()
+            if deleted:
+                logger.info("Removidas {} sessões ruins do histórico.", deleted)
+        except Exception:
+            pass
+
         if not self.tracker.open_camera():
             return
         try:
@@ -1154,6 +1217,26 @@ class CalibrationSession:
 
             # ── Setup físico (uma vez por sessão) ─────────────────────────────
             saved_profile = GazeProfile.load()
+            if saved_profile is not None:
+                _yr = saved_profile.gaze_y_max - saved_profile.gaze_y_min
+                if _yr < 0.12:
+                    logger.warning(
+                        "Perfil corrompido: range_y={:.4f} < 0.12 (Y colapsado). "
+                        "Deletando {} para forçar recalibração.",
+                        _yr, _PROFILE_PATH,
+                    )
+                    try:
+                        os.remove(_PROFILE_PATH)
+                    except OSError:
+                        pass
+                    _clean = GazeProfile()
+                    _clean.monitor_inches    = saved_profile.monitor_inches
+                    _clean.camera_position   = saved_profile.camera_position
+                    _clean.distance_cm       = saved_profile.distance_cm
+                    _clean.vertical_offset   = saved_profile.vertical_offset
+                    _clean.horizontal_offset = saved_profile.horizontal_offset
+                    _clean.setup_configured  = saved_profile.setup_configured
+                    saved_profile = _clean
             _base_profile = saved_profile if saved_profile is not None else GazeProfile()
             _base_profile = self._physical_setup_screen(_base_profile)
 
@@ -1208,79 +1291,31 @@ class CalibrationSession:
                     weights += [self.TRAJ_WEIGHT] * len(feats2)
                     logger.info("Fase 2: {} amostras.", len(feats2))
 
-                # ── Ajuste do modelo com prior MPIIGaze + histórico ──────────
+                # ── Ajuste do modelo afim com histórico ──────────────────────
                 from calib_store import load_historical, save_session
 
                 # 1. Histórico de sessões anteriores do mesmo paciente
                 hist_feats, hist_pos, hist_weights = load_historical(
                     max_sessions=5,
                     decay=0.60,
-                    max_error_px=120.0,
+                    max_error_px=300.0,
                 )
                 logger.info("Histórico: {} pontos de sessões anteriores.", len(hist_feats))
 
-                # 2. Prior MPIIGaze com filtragem por setup físico
-                prior_feats:   list = []
-                prior_pos:     list = []
-                prior_weights: list = []
-
-                _prior_path = os.path.join(os.path.dirname(__file__), "prior_gaze.npy")
-                if os.path.exists(_prior_path):
-                    try:
-                        prior_data = np.load(_prior_path, allow_pickle=True).item()
-                        p_feats    = prior_data["features"]
-                        p_poses    = prior_data["positions"]
-                        p_weight   = float(prior_data["weight"])
-
-                        gx_range   = max(profile.gaze_x_max - profile.gaze_x_min, 1e-5)
-                        gy_range   = max(profile.gaze_y_max - profile.gaze_y_min, 1e-5)
-                        p_gx_range = max(float(prior_data["gx_max"]) - float(prior_data["gx_min"]), 1e-5)
-                        p_gy_range = max(float(prior_data["gy_max"]) - float(prior_data["gy_min"]), 1e-5)
-
-                        for feat, pos in zip(p_feats, p_poses):
-                            pos_y = float(pos[1])
-                            # Monitor grande + câmera em cima: usar só região central-inferior
-                            if (profile.monitor_inches >= 23.0
-                                    and profile.camera_position == "top"
-                                    and pos_y <= 0.3):
-                                continue
-
-                            nx = (feat[0] - float(prior_data["gx_min"])) / p_gx_range
-                            ny = (feat[1] - float(prior_data["gy_min"])) / p_gy_range
-
-                            mapped = np.array([
-                                nx * gx_range + profile.gaze_x_min,
-                                ny * gy_range + profile.gaze_y_min,
-                            ], dtype=np.float64)
-                            norm = profile.normalize(mapped)
-
-                            prior_feats.append(norm)
-                            prior_pos.append((float(pos[0]), float(pos[1])))
-                            prior_weights.append(p_weight)
-
-                        logger.info("Prior MPIIGaze carregado: {} pontos (peso={}).",
-                                    len(prior_feats), p_weight)
-                    except Exception as e:
-                        logger.warning("Falha ao carregar prior MPIIGaze: {}", e)
-                else:
-                    logger.info("prior_gaze.npy não encontrado — rodando sem prior. "
-                                "Execute scripts/build_prior.py para gerar.")
-
-                # 3. Aplica correção geométrica nas posições da sessão atual
+                # 2. Aplica correção geométrica nas posições da sessão atual
                 pos1_corr  = _apply_geometric_correction(pos1,  profile)
                 pos2_corr  = _apply_geometric_correction(pos2,  profile)
                 hist_pos_c = _apply_geometric_correction(hist_pos, profile)
 
-                # 4. Combina: sessão corrigida + histórico corrigido + prior
-                all_feats   = feats1 + feats2 + hist_feats   + prior_feats
-                all_pos     = pos1_corr + pos2_corr + hist_pos_c + prior_pos
-                all_weights = weights           + hist_weights + prior_weights
+                # 3. Combina: sessão corrigida + histórico corrigido
+                all_feats   = feats1 + feats2 + hist_feats
+                all_pos     = pos1_corr + pos2_corr + hist_pos_c
+                all_weights = weights + hist_weights
 
                 logger.info(
-                    "model.fit(): {} pts sessão + {} histórico + {} prior = {} total",
+                    "model.fit(): {} pts sessão + {} histórico = {} total",
                     len(feats1) + len(feats2),
                     len(hist_feats),
-                    len(prior_feats),
                     len(all_feats),
                 )
 
@@ -1308,7 +1343,7 @@ class CalibrationSession:
                     pos1_corr  = _apply_geometric_correction(pos1,  profile)
                     pos2_corr  = _apply_geometric_correction(pos2,  profile)
                     hist_pos_c = _apply_geometric_correction(hist_pos, profile)
-                    all_pos    = pos1_corr + pos2_corr + hist_pos_c + prior_pos
+                    all_pos    = pos1_corr + pos2_corr + hist_pos_c
                     self.model.fit(all_feats, all_pos, all_weights)
                     self.model.reset_smoothing()
                     self._calib_all_pos = list(all_pos)
@@ -1345,3 +1380,11 @@ class CalibrationSession:
 
         finally:
             self.tracker.stop()
+
+
+if __name__ == "__main__":
+    from iris_tracker import IrisTracker
+    tracker = IrisTracker()
+    tracker.open_camera()
+    session = CalibrationSession(tracker)
+    session.run()

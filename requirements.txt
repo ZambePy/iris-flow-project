@@ -4,11 +4,13 @@
 # ==============================================
 
 # --- Visão computacional ---
-mediapipe==0.10.21
 opencv-python==4.10.0.84
 numpy==1.26.4
 
 # --- IA e modelos ---
+torch>=2.5.0
+torchvision>=0.20.0
+dlib==19.24.6            # opcional — head pose mais preciso (requer cmake)
 tensorflow==2.16.1
 onnxruntime==1.18.1
 openai-whisper==20231117
@@ -48,5 +50,5 @@ httpx==0.27.0          # Cliente HTTP para testar a API
 pydantic==2.7.4
 pydantic-settings==2.3.1
 loguru==0.7.2          # Logs mais legíveis
-scipy>=1.11.0          # RBFInterpolator para calibração
+scipy>=1.11.0          # usado por train_iris.py para carregar .mat do MPIIGaze
 filterpy>=1.4.5        # Filtro de Kalman (Camada 5)

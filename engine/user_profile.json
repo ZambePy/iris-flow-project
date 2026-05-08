@@ -1,15 +1,15 @@
 {
-  "gaze_x_min": -0.9698899698435828,
-  "gaze_x_max": 0.9250094656028521,
-  "gaze_y_min": 0.10410704685376053,
-  "gaze_y_max": 0.19487671958627156,
-  "variance": 0.07360901864563793,
+  "gaze_x_min": 0.499998,
+  "gaze_x_max": 0.500002,
+  "gaze_y_min": 0.375,
+  "gaze_y_max": 0.625,
+  "variance": 0.0,
   "dominant": "left",
   "has_glasses": false,
-  "monitor_inches": 15.6,
+  "monitor_inches": 24.0,
   "camera_position": "top",
-  "distance_cm": 60.0,
+  "distance_cm": 40.0,
   "vertical_offset": 0.0,
   "horizontal_offset": 0.0,
-  "setup_configured": false
+  "setup_configured": true
 }

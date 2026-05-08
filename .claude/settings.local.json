@@ -9,7 +9,17 @@
       "Bash(.venv/Scripts/pip.exe install *)",
       "Bash(.venv/Scripts/python main.py)",
       "Bash(echo \"EXIT:$?\")",
-      "Bash(.venv/Scripts/python.exe scripts/build_prior.py)"
+      "Bash(.venv/Scripts/python.exe scripts/build_prior.py)",
+      "Bash(.venv/Scripts/python.exe main.py)",
+      "Bash(.venv/Scripts/python.exe scripts/inspect_datasets.py)",
+      "Bash(.venv/Scripts/pip install *)",
+      "Bash(.venv/Scripts/python.exe scripts/train_iris.py)",
+      "Bash(taskkill /F /IM python.exe /T)",
+      "PowerShell(Get-Process python -ErrorAction SilentlyContinue | Select-Object Id, CPU, @{N='RAM_MB';E={[math]::Round\\($_.WorkingSet/1MB,0\\)}}, StartTime)",
+      "Bash(powershell *)",
+      "PowerShell(Stop-Process *)",
+      "PowerShell(.venv\\\\Scripts\\\\python.exe scripts/train_iris.py)",
+      "Bash(tasklist)"
     ]
   }
 }
